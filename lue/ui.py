@@ -146,14 +146,14 @@ def get_terminal_size():
         return 80, 24
 
 def update_document_layout(reader):
-    """Update the document layout based on terminal size."""
-    reader.document_lines = []
-    reader.line_to_position = {}
-    reader.position_to_line = {}
-    reader.paragraph_line_ranges = {}
-    
+    """Update the document layout based on terminal size.
+
+    布局构建（rich 的逐段 wrap 测量）在大文档上开销显著，而 UI 模式切换
+    （v 键）只在 available_width 变化时才需要重建，因此按宽度缓存布局，
+    命中时直接复用，消除模式切换时的卡顿。
+    """
     width, _ = get_terminal_size()
-    
+
     # Adjust available width based on UI mode
     if config.UI_MODE == 0 or config.UI_MODE == 3:
         # Mode 0 or 3: Full screen width for text
@@ -161,48 +161,74 @@ def update_document_layout(reader):
     else:
         # Mode 1 and 2: Account for borders and padding
         available_width = max(20, width - 10)
-    
-    for chap_idx, chapter in enumerate(reader.chapters):
-        if chap_idx > 0:
-            reader.document_lines.append(Text("", style=COLORS.TEXT_NORMAL))
-            
-        for para_idx, paragraph in enumerate(chapter):
-            paragraph_start_line = len(reader.document_lines)
-            
-            plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-            wrapped_lines = plain_text.wrap(reader.console, available_width)
-            paragraph_end_line = len(reader.document_lines) + len(wrapped_lines) - 1
-            
-            reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
-            
-            sentences = content_parser.split_into_sentences(paragraph)
-            current_char_pos = 0
-            for sent_idx, sentence in enumerate(sentences):
-                sentence_start = current_char_pos
-                sentence_end = current_char_pos + len(sentence)
-                
-                line_char_pos = 0
-                for line_idx, line in enumerate(wrapped_lines):
-                    line_start = line_char_pos
-                    line_end = line_char_pos + len(line.plain)
-                    
-                    if line_start <= sentence_start < line_end:
-                        global_line_idx = paragraph_start_line + line_idx
-                        reader.position_to_line[(chap_idx, para_idx, sent_idx)] = global_line_idx
-                        break
-                    
-                    line_char_pos = line_end
-                
-                current_char_pos = sentence_end + 1
-            
-            for line_idx in range(len(wrapped_lines)):
-                global_line_idx = paragraph_start_line + line_idx
-                reader.line_to_position[global_line_idx] = (chap_idx, para_idx, 0)
-            
-            reader.document_lines.extend(wrapped_lines)
-            
-            if para_idx < len(chapter) - 1:
+
+    cache = getattr(reader, '_layout_cache', None)
+    cached = cache.get(available_width) if cache else None
+    if cached:
+        reader.document_lines = cached['lines']
+        reader.line_to_position = cached['line_to_position']
+        reader.position_to_line = cached['position_to_line']
+        reader.paragraph_line_ranges = cached['paragraph_ranges']
+    else:
+        reader.document_lines = []
+        reader.line_to_position = {}
+        reader.position_to_line = {}
+        reader.paragraph_line_ranges = {}
+
+        for chap_idx, chapter in enumerate(reader.chapters):
+            if chap_idx > 0:
                 reader.document_lines.append(Text("", style=COLORS.TEXT_NORMAL))
+
+            for para_idx, paragraph in enumerate(chapter):
+                paragraph_start_line = len(reader.document_lines)
+
+                plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+                wrapped_lines = plain_text.wrap(reader.console, available_width)
+                paragraph_end_line = len(reader.document_lines) + len(wrapped_lines) - 1
+
+                reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
+
+                sentences = content_parser.split_into_sentences(paragraph)
+                current_char_pos = 0
+                for sent_idx, sentence in enumerate(sentences):
+                    sentence_start = current_char_pos
+                    sentence_end = current_char_pos + len(sentence)
+
+                    line_char_pos = 0
+                    for line_idx, line in enumerate(wrapped_lines):
+                        line_start = line_char_pos
+                        line_end = line_char_pos + len(line.plain)
+
+                        if line_start <= sentence_start < line_end:
+                            global_line_idx = paragraph_start_line + line_idx
+                            reader.position_to_line[(chap_idx, para_idx, sent_idx)] = global_line_idx
+                            break
+
+                        line_char_pos = line_end
+
+                    current_char_pos = sentence_end + 1
+
+                for line_idx in range(len(wrapped_lines)):
+                    global_line_idx = paragraph_start_line + line_idx
+                    reader.line_to_position[global_line_idx] = (chap_idx, para_idx, 0)
+
+                reader.document_lines.extend(wrapped_lines)
+
+                if para_idx < len(chapter) - 1:
+                    reader.document_lines.append(Text("", style=COLORS.TEXT_NORMAL))
+
+        if cache is None:
+            cache = reader._layout_cache = {}
+        cache[available_width] = {
+            'lines': reader.document_lines,
+            'line_to_position': reader.line_to_position,
+            'position_to_line': reader.position_to_line,
+            'paragraph_ranges': reader.paragraph_line_ranges,
+        }
+        # 只保留最近使用的两个宽度，避免终端频繁 resize 时内存无限增长
+        if len(cache) > 2:
+            for old_width in sorted(cache.keys())[:-2]:
+                del cache[old_width]
 
     if hasattr(reader, '_initial_load_complete') and reader._initial_load_complete:
         scroll_was_set = False
@@ -818,7 +844,8 @@ def render_chapter_index_overlay(reader, width, height):
         title = f"Chapter {i + 1}"
         for para in chapter:
             stripped = para.strip()
-            if stripped and len(stripped) > 3:
+            if stripped:
+                # 章节首段通常是标题行（如“第五章”/“尾声”），直接采用
                 title = stripped
                 if len(title) > 60:
                     title = title[:57] + "..."
