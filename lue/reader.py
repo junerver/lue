@@ -129,7 +129,8 @@ class Lue:
         chapter = self.chapters[idx]
         for para in chapter:
             stripped = para.strip()
-            if stripped and len(stripped) > 3:
+            if stripped:
+                # 章节首段通常是其标题行（如“第五章”/“尾声”），直接采用
                 return stripped[:60]
         return f"Chapter {idx + 1}"
 
@@ -301,7 +302,7 @@ class Lue:
             if abs(click_paragraph - current_paragraph) == 1:
                 if click_paragraph < current_paragraph:  # Previous paragraph
                     # Check if click is near the end of the previous paragraph
-                    sentences_in_paragraph = len(self.chapters[click_chapter][click_paragraph].split('. '))
+                    sentences_in_paragraph = len(content_parser.split_into_sentences(self.chapters[click_chapter][click_paragraph]))
                     return click_sentence >= max(0, sentences_in_paragraph - threshold)
                 else:  # Next paragraph
                     # Check if click is near the beginning of the next paragraph
@@ -324,7 +325,7 @@ class Lue:
                 return True
             else:  # direction == 'prev'
                 # If we're not at the end of the current paragraph, it's not near
-                sentences_in_paragraph = len(self.chapters[current_chapter][current_paragraph].split('. '))
+                sentences_in_paragraph = len(content_parser.split_into_sentences(self.chapters[current_chapter][current_paragraph]))
                 if current_sentence < sentences_in_paragraph - 1:
                     return False
                 # If we're at the end of the current paragraph, previous paragraph is near
@@ -1283,12 +1284,15 @@ class Lue:
         signal.signal(signal.SIGWINCH, self._handle_resize)
         signal.signal(signal.SIGINT, self._handle_exit_signal)
         signal.signal(signal.SIGTERM, self._handle_exit_signal)
+        if hasattr(signal, 'SIGHUP'):
+            # 终端窗口被关闭时保存进度后再退出
+            signal.signal(signal.SIGHUP, self._handle_exit_signal)
         
         if not self.chapters or not self.chapters[0]: return
-            
+
         self.ui_update_task = asyncio.create_task(self._ui_update_loop())
         self.word_update_task = asyncio.create_task(self._word_update_loop())
-        
+
         await audio.play_from_current_position(self)
         
         while self.running:

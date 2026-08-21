@@ -335,7 +335,15 @@ async def main():
         sys.stdout.write('\033[?1049h')
         sys.stdout.flush()
 
-        await reader.run()
+        try:
+            await reader.run()
+        except Exception:
+            # 异常退出兜底：尽力保存阅读进度（保存为同步写，不依赖事件循环）
+            logging.exception("Reader crashed, attempting to save progress")
+            try:
+                reader._save_extended_progress()
+            except Exception:
+                logging.exception("Failed to save progress on crash")
 
     finally:
         sys.stdout.write('\033[?1049l\033[?1000l\033[?1006l\033[?25h')

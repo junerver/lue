@@ -5,6 +5,7 @@ import json
 import re
 import glob
 from . import config
+from . import content_parser
 
 
 def get_progress_file_path(book_title):
@@ -127,14 +128,12 @@ def save_extended_progress(progress_file, chapter_idx, paragraph_idx, sentence_i
         progress["manual_scroll_anchor"] = manual_scroll_anchor
     if original_file_path:
         progress["original_file_path"] = original_file_path
-    
-    # Save percentage if provided (default to 0.0 if not in args, but we will add it to args)
-    # Note: The function signature will be updated in the next step to include percentage.
-    # For now, we'll just add it if passed in kwargs or update the signature.
-    # Actually, I should update the signature in the same edit.
-        
-    with open(progress_file, 'w', encoding='utf-8') as f:
+
+    # 原子写入：先写临时文件再替换，避免异常退出时进度文件写一半损坏
+    tmp_file = progress_file + ".tmp"
+    with open(tmp_file, 'w', encoding='utf-8') as f:
         json.dump(progress, f, indent=2)
+    os.replace(tmp_file, progress_file)
 
 def get_recent_books(limit=5):
     """
@@ -198,7 +197,7 @@ def validate_and_set_progress(chapters, progress_file, c, p, s):
     """
     try:
         paragraph = chapters[c][p]
-        sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+        sentences = content_parser.split_into_sentences(paragraph)
         _ = sentences[s]  # Test if sentence exists
         return c, p, s
     except IndexError:
