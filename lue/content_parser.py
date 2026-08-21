@@ -2,7 +2,7 @@ import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-import fitz
+import pymupdf
 import markdown
 from docx import Document
 from striprtf.striprtf import rtf_to_text
@@ -652,9 +652,9 @@ def _extract_content_pdf(file_path, console):
 
 
     try:
-        doc = fitz.open(file_path)
+        doc = pymupdf.open(file_path)
     except Exception as e:
-        console.print(f"[bold red]Error: Failed to open file with fitz: {e}[/bold red]")
+        console.print(f"[bold red]Error: Failed to open file with pymupdf: {e}[/bold red]")
         return []
 
     # Initialize filtering based on config
