@@ -1248,20 +1248,36 @@ class Lue:
                 if os.path.exists(log_file):
                     with open(log_file, 'r') as f:
                         lines = f.readlines()
-                    
+
                     start_indices = [i for i, line in enumerate(lines) if "--- Application Starting ---" in line]
                     last_start_index = start_indices[-1] if start_indices else 0
-                    
+
                     session_lines = lines[last_start_index:]
                     error_lines = [line.strip() for line in session_lines if " - ERROR - " in line]
-                    
+
                     if error_lines:
+                        # 去重计数后限量显示：网络抖动等会重复产生大量相同错误
+                        # （如 Edge TTS 的 NoAudioReceived），逐条打印会在退出时刷屏
+                        counts = {}
+                        order = []
+                        for line in error_lines:
+                            message = ' - '.join(line.split(' - ')[3:])
+                            if message not in counts:
+                                counts[message] = 0
+                                order.append(message)
+                            counts[message] += 1
+
                         error_console = Console()
                         error_console.print("\n[bold red]Errors recorded during this session:[/bold red]")
-                        for error in error_lines:
-                            message = ' - '.join(error.split(' - ')[3:])
-                            error_console.print(f"- {message}")
-                    
+                        max_shown = 8
+                        for message in order[:max_shown]:
+                            n = counts[message]
+                            suffix = f" [dim](x{n})[/dim]" if n > 1 else ""
+                            error_console.print(f"- {message}{suffix}")
+                        if len(order) > max_shown:
+                            error_console.print(f"- ... and {len(order) - max_shown} more kinds")
+                        error_console.print(f"[dim]Full log: {log_file}[/dim]")
+
                     # Clear the log file after displaying errors
                     os.remove(log_file)
             except FileNotFoundError:
