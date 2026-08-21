@@ -29,12 +29,10 @@ class EdgeTTS(TTSBase):
             import edge_tts
             self.edge_tts = edge_tts
             self.initialized = True
-            self.console.print("[green]Edge TTS model is available.[/green]")
+            logging.info("Edge TTS model is available.")
             return True
         except ImportError:
-            self.console.print("[bold red]Error: 'edge-tts' package not found.[/bold red]")
-            self.console.print("[yellow]Please run 'pip install edge-tts' to use this TTS model.[/yellow]")
-            logging.error("'edge-tts' is not installed.")
+            logging.error("'edge-tts' is not installed. Please run 'pip install edge-tts' to use this TTS model.")
             return False
 
     async def get_raw_timing_data(self, text: str, output_path: str):
@@ -121,15 +119,13 @@ class EdgeTTS(TTSBase):
         if not self.initialized:
             return
 
-        self.console.print("[bold cyan]Warming up the Edge TTS model...[/bold cyan]")
+        logging.info("Warming up the Edge TTS model...")
         warmup_file = os.path.join(config.AUDIO_DATA_DIR, f".warmup_edge.{self.output_format}")
         try:
             await self.generate_audio("Ready.", warmup_file)
-            self.console.print("[green]Edge TTS model is ready.[/green]")
+            logging.info("Edge TTS model is ready.")
         except Exception as e:
-            self.console.print(f"[bold yellow]Warning: Edge model warm-up failed.[/bold yellow]")
-            self.console.print(f"[yellow]This may indicate a network issue or an invalid voice name: {self.voice}[/yellow]")
-            logging.warning(f"Edge TTS model warm-up failed: {e}", exc_info=True)
+            logging.warning(f"Edge TTS model warm-up failed (possible network issue or invalid voice: {self.voice}): {e}", exc_info=True)
         finally:
             if os.path.exists(warmup_file):
                 try:

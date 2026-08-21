@@ -35,6 +35,9 @@ class Lue:
         self.playback_processes = []
         self.producer_task = None
         self.player_task = None
+        # TTS 后台初始化任务与就绪标志（就绪前播放请求会被跳过）
+        self.tts_init_task = None
+        self.tts_ready = False
         self.ui_update_task = None
         self.command_received_event = asyncio.Event()
         self.playback_finished_event = asyncio.Event()
@@ -81,7 +84,6 @@ class Lue:
             
         if not quiet:
             self.console.print(f"[green]Document loaded successfully![/green]")
-            self.console.print(f"[bold cyan]Loading TTS model...[/bold cyan]")
         
         self.document_lines = []
         self.line_to_position = {}
@@ -252,17 +254,30 @@ class Lue:
         self.subtitle_hitboxes = []
 
     async def initialize_tts(self) -> bool:
-        """Initializes the selected TTS model."""
-        if not self.tts_model:
-            self.console.print("[yellow]No TTS model selected. TTS playback is disabled.[/yellow]")
-            return True
-        
-        initialized = await self.tts_model.initialize()
-        if initialized:
+        """Initializes the selected TTS model without blocking startup.
+
+        Runs as a background task after the UI is up; when it finishes the
+        reader is marked ready and playback resumes automatically if the
+        book was in a playing state.
+        """
+        try:
+            initialized = await self.tts_model.initialize()
+            if not initialized:
+                logging.error(f"Initialization of {self.tts_model.name.upper()} failed. TTS will be disabled.")
+                self.tts_model = None
+                self.is_paused = True
+                return False
             await self.tts_model.warm_up()
+            self.tts_ready = True
+            if not self.is_paused and self.running:
+                # 进度恢复为播放状态时，producer 可能因 TTS 未就绪而空转退出，
+                # 就绪后重新启动播放
+                await audio.play_from_current_position(self)
             return True
-        else:
-            self.console.print(f"[bold red]Initialization of {self.tts_model.name.upper()} failed. TTS will be disabled.[/bold red]")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception(f"Initialization of TTS failed. TTS will be disabled.")
             self.tts_model = None
             self.is_paused = True
             return False
@@ -1225,7 +1240,7 @@ class Lue:
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         
         # Cancel all tasks including pending restart task and pause toggle task
-        tasks_to_cancel = [self.smooth_scroll_task, self.ui_update_task, self.word_update_task, self.pending_restart_task, self.current_pause_toggle_task]
+        tasks_to_cancel = [self.smooth_scroll_task, self.ui_update_task, self.word_update_task, self.pending_restart_task, self.current_pause_toggle_task, self.tts_init_task]
         for task in tasks_to_cancel:
             if task and not task.done():
                 task.cancel()
@@ -1311,6 +1326,10 @@ class Lue:
 
         self.ui_update_task = asyncio.create_task(self._ui_update_loop())
         self.word_update_task = asyncio.create_task(self._word_update_loop())
+
+        # TTS 模型后台并发初始化，不阻塞书籍打开与阅读
+        if self.tts_model:
+            self.tts_init_task = asyncio.create_task(self.initialize_tts())
 
         await audio.play_from_current_position(self)
         

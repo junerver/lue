@@ -81,15 +81,11 @@ class KokoroTTS(TTSBase):
             self.KPipeline = KPipeline
             self.huggingface_hub = huggingface_hub
         except SystemExit:
-            self.console.print("[bold red]Error: The TTS library exited unexpectedly during import.[/bold red]")
-            self.console.print("[yellow]This can happen if a required dependency is missing or misconfigured.[/yellow]")
-            logging.error("SystemExit was called during Kokoro TTS import.")
+            logging.error("SystemExit was called during Kokoro TTS import. A required dependency may be missing or misconfigured.")
             return False
         except ImportError as e:
             package = str(e).split("'")[1]
-            self.console.print(f"[bold red]Error: '{package}' package not found.[/bold red]")
-            self.console.print(f"[yellow]Please ensure torch, kokoro, soundfile, etc. are installed to use this TTS model.[/yellow]")
-            logging.error(f"'{package}' is not installed for Kokoro TTS.")
+            logging.error(f"'{package}' is not installed for Kokoro TTS. Please ensure torch, kokoro, soundfile, etc. are installed.")
             return False
 
         self._patch_hf_downloader()
@@ -118,21 +114,17 @@ class KokoroTTS(TTSBase):
 
         try:
             pipeline, (gpu_msg, error_details), device_used = await loop.run_in_executor(None, _blocking_init)
-            self.console.print(f"[cyan]GPU Check: {gpu_msg}[/cyan]")
+            logging.info(f"GPU Check: {gpu_msg}")
 
             if pipeline:
                 self.pipeline = pipeline
-                self.console.print(f"[green]Kokoro TTS model initialized successfully on {device_used}.[/green]")
+                logging.info(f"Kokoro TTS model initialized successfully on {device_used}.")
                 self.initialized = True
                 return True
             else:
-                self.console.print(f"[bold red]Kokoro initialization failed.[/bold red]")
-                if error_details:
-                    self.console.print(f"[red]Error details: {error_details}[/red]")
-                    logging.error(f"Kokoro initialization failed: {error_details}")
+                logging.error(f"Kokoro initialization failed: {error_details}")
                 return False
         except Exception as e:
-            self.console.print(f"[bold red]An unexpected error occurred during Kokoro's async initialization: {e}[/bold red]")
             logging.error("Kokoro async initialization failed.", exc_info=True)
             return False
 
@@ -141,14 +133,13 @@ class KokoroTTS(TTSBase):
         if not self.initialized:
             return
 
-        self.console.print("[bold cyan]Warming up the Kokoro TTS model... (this may take a minute)[/bold cyan]")
+        logging.info("Warming up the Kokoro TTS model... (this may take a minute)")
         warmup_file = os.path.join(config.AUDIO_DATA_DIR, f".warmup_kokoro.{self.output_format}")
 
         try:
             await self.generate_audio("Ready.", warmup_file)
-            self.console.print("[green]Kokoro TTS model is ready.[/green]")
+            logging.info("Kokoro TTS model is ready.")
         except Exception as e:
-            self.console.print(f"[bold yellow]Warning: Kokoro model warm-up failed.[/bold yellow]")
             logging.warning(f"Kokoro TTS warm-up failed: {e}", exc_info=True)
         finally:
             if os.path.exists(warmup_file):

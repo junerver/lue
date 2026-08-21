@@ -106,7 +106,8 @@ async def get_audio_duration(file_path):
 
 async def play_from_current_position(reader):
     """Start the audio producer and player loops."""
-    if not reader.is_paused and reader.running and reader.tts_model:
+    # tts_ready: TTS 模型后台初始化完成前不启动播放（初始化完成后会重新调用）
+    if not reader.is_paused and reader.running and reader.tts_model and getattr(reader, 'tts_ready', True):
         # Cancel existing tasks and wait for them to complete
         for task in [reader.producer_task, reader.player_task]:
             if task and not task.done():

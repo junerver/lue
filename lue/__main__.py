@@ -325,11 +325,8 @@ async def main():
     
     try:
         tty.setcbreak(sys.stdin.fileno())
-        
-        initialized = await reader.initialize_tts()
-        if not initialized and hasattr(args, 'tts') and args.tts and args.tts != "none":
-            console.print(f"[bold yellow]Warning: TTS model '{args.tts}' "
-                         "failed to initialize and has been disabled.[/bold yellow]")
+
+        # TTS 模型改为后台并发初始化（见 reader.run），不再阻塞书籍打开
 
         # Switch to alternate screen buffer just before running the UI
         sys.stdout.write('\033[?1049h')
