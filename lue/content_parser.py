@@ -712,39 +712,262 @@ def _extract_content_pdf(file_path, console):
 
     return chapters
 
-def _extract_content_txt(file_path, console):
+# ---------------------------------------------------------------------------
+# TXT 小说章节识别
+# 规则与选择算法移植自 legado（https://github.com/gedoor/legado）的
+# txtTocRule.json 与 TextFile.kt，用于中文/日文等网络小说的章节分段。
+# ---------------------------------------------------------------------------
+
+# 章节标题规则，按优先级排列（对应 legado asset 中默认启用的规则）。
+# 注意：Python 的 \s 与 Java 一致，均不匹配全角空格 U+3000，规则中已显式包含。
+TXT_TOC_RULES = [
+    # 目录(去空白)：标题前需有空白/全角空格，避免把正文顶格行误判为标题
+    r"(?<=[　\s])(?:序章|楔子|正文(?!完|结)|终章|后记|尾声|番外|第\s{0,4}[\d〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+?\s{0,4}(?:章|节(?!课)|卷|集(?![合和]))).{0,30}$",
+    # 目录：标准“第X章/卷/节”标题，最多 4 个缩进
+    r"^[ 　\t]{0,4}(?:序章|楔子|正文(?!完|结)|终章|后记|尾声|番外|第\s{0,4}[\d〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+?\s{0,4}(?:章|节(?!课)|卷|集(?![合和])|部(?![分赛游])|篇(?!张))).{0,30}$",
+    # 数字 分隔符 标题名称："1、xxx"
+    r"^[ 　\t]{0,4}\d{1,5}[:：,.， 、_—\-].{1,30}$",
+    # 大写数字 分隔符 标题名称："一、xxx"
+    r"^[ 　\t]{0,4}(?:序章|楔子|正文(?!完|结)|终章|后记|尾声|番外|[零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,8}章?)[ 、_—\-].{1,30}$",
+    # 正文 标题/序号
+    r"^[ 　\t]{0,4}正文[ 　]{1,4}.{0,20}$",
+    # Chapter/Section/Part/Episode 序号 标题
+    r"^[ 　\t]{0,4}(?:[Cc]hapter|[Ss]ection|[Pp]art|ＰＡＲＴ|[Nn][oO][.、]|[Ee]pisode|(?:内容|文章)?简介|文案|前言|序章|楔子|正文(?!完|结)|终章|后记|尾声|番外)\s{0,4}\d{1,4}.{0,30}$",
+    # 特殊符号 序号 标题："【第一章 xxx"
+    r"(?<=[\s　])[【〔〖「『〈［\[](?:第|[Cc]hapter)[\d零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,10}[章节].{0,20}$",
+    # 特殊符号 标题(单个)："☆、xxx"（原规则用可变宽 lookbehind，此处改写为行首形式）
+    r"^[ 　\t]{0,4}(?:[☆★✦✧].{1,30}|(?:内容|文章)?简介|文案|前言|序章|楔子|正文(?!完|结)|终章|后记|尾声|番外)[ 　]{0,4}$",
+    # 章/卷 序号 标题："卷五 开源盛世"
+    r"^[ \t　]{0,4}(?:(?:内容|文章)?简介|文案|前言|序章|楔子|正文(?!完|结)|终章|后记|尾声|番外|[卷章][\d零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,8})[ 　]{0,4}.{0,30}$",
+    # 书名 括号 序号："标题(12)"
+    r"^[一-龥]{1,20}[ 　\t]{0,4}[(（][\d〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,8}[)）][ 　\t]{0,4}$",
+    # 书名 序号："标题12"
+    r"^[一-龥]{1,20}[ 　\t]{0,4}[\d〇零一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]{1,8}[ 　\t]{0,4}$",
+    # 字数分割 分节阅读："分节阅读"、"第一页"（原规则用可变宽 lookbehind，此处改写为行首形式）
+    r"^[ 　\t]{0,4}(?:.{0,15}分[页节章段]阅读[-_ ]|第\s{0,4}[\d零一二两三四五六七八九十百千万]{1,6}\s{0,4}[页节]).{0,30}$",
+]
+
+# 规则选择时采样的最大字符数
+_TOC_RULE_SAMPLE_SIZE = 500 * 1024
+# 匹配到的标题前内容超过该长度才计为有效章节（否则视为卷/误报）
+_TOC_VALID_CHAPTER_LENGTH = 1000
+# 匹配到的标题前内容不足该长度计为一次误报
+_TOC_ERROR_CHAPTER_LENGTH = 100
+# 某条规则的有效章节数超过该值即认为足够好，不再评估后续规则
+_TOC_GOOD_ENOUGH = 70
+# 候选规则需比当前最优规则多出该数量的有效章节才能胜出
+_TOC_RULE_OVERSHOOT = 2
+# 无标题规则时按字数兜底分章的长度
+_TOC_FALLBACK_CHAPTER_CHARS = 10 * 1024
+# 判定“每行即一段”的最大平均行长（中英文小说正文行通常不超过该值）
+_AVG_LINE_AS_PARAGRAPH_LIMIT = 120
+# 单行超长时按句子拆段的基准长度
+_SENTENCE_PARAGRAPH_CHARS = 200
+
+
+def _pick_toc_rule(sample):
+    """从规则集中选出最适合当前文本的章节标题规则（移植自 legado getTocRule）。
+
+    评估标准：标题前有足够长正文（>1000 字符）算一次有效章节，标题前内容
+    不足 100 字符算一次误报；有效章节数需 >= 误报数*3，且比当前最优规则
+    多出 _TOC_RULE_OVERSHOOT 个才算胜出。
+    """
+    best_count = -1
+    best_rule = None
+    for rule in TXT_TOC_RULES:
+        pattern = re.compile(rule, re.MULTILINE)
+        cs_num = 0
+        num_e = 0
+        start = 0
+        for m in pattern.finditer(sample):
+            content_length = m.start() - start
+            if start == 0 or content_length > _TOC_VALID_CHAPTER_LENGTH:
+                cs_num += 1
+                start = m.end()
+            elif content_length < _TOC_ERROR_CHAPTER_LENGTH:
+                num_e += 1
+        if cs_num >= num_e * 3 and cs_num > best_count + _TOC_RULE_OVERSHOOT:
+            best_count = cs_num
+            best_rule = rule
+            if best_count > _TOC_GOOD_ENOUGH:
+                break
+    return best_rule
+
+
+def _collect_title_lines(content, rule):
+    """返回规则在原文中匹配到的标题所在行号（0 基，按原文行计算）。"""
+    line_starts = []
+    pos = 0
+    for line in content.split('\n'):
+        line_starts.append(pos)
+        pos += len(line) + 1
+
+    import bisect
+    title_lines = set()
+    for m in re.finditer(rule, content, re.MULTILINE):
+        title_lines.add(bisect.bisect_right(line_starts, m.start()) - 1)
+    return title_lines
+
+
+def _split_txt_by_rule(content, doc_lines, rule):
+    """按标题规则把（行号标注的）正文行切分为章节列表。
+
+    doc_lines 为 [(原文行号, 清洗后文本), ...]。标题行作为该章节的第一个
+    段落保留，便于 UI 展示与 TTS 朗读。第一个标题之前的正文作为“前言”章节。
+    """
+    title_lines = _collect_title_lines(content, rule)
+    if not title_lines:
+        return None
+
+    first_title = min(title_lines)
+    chapters = []
+    current = []
+    for line_no, text in doc_lines:
+        if line_no in title_lines:
+            if current:
+                chapters.append(current)
+            current = [text]
+        elif line_no < first_title:
+            # 前言正文，稍后单独成章，避免与章节内容重复
+            continue
+        elif text and len(text) > 3:
+            current.append(text)
+    if current:
+        chapters.append(current)
+
+    # 前言：第一个标题前的正文独立成章（与 legado 的序章处理一致）
+    intro = [text for line_no, text in doc_lines if line_no < first_title and text]
+    if intro:
+        chapters.insert(0, intro)
+    return chapters
+
+
+def _split_txt_by_size(lines, max_chars=_TOC_FALLBACK_CHAPTER_CHARS):
+    """无标题规则时的兜底：按字数把正文切分为若干章。"""
+    chapters = []
+    current = []
+    total = 0
+    for line in lines:
+        current.append(line)
+        total += len(line)
+        if total >= max_chars:
+            chapters.append(current)
+            current = []
+            total = 0
+    if current:
+        chapters.append(current)
+    return chapters
+
+
+def _split_long_text_into_paragraphs(text, max_chars=_SENTENCE_PARAGRAPH_CHARS):
+    """整段无换行的超长文本：按句子标点拆分为多个段落。"""
+    parts = re.split(r'(?<=[。！？!?；;])', text)
+    paragraphs = []
+    buf = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        buf += part
+        if len(buf) >= max_chars:
+            paragraphs.append(buf)
+            buf = ""
+    if buf:
+        paragraphs.append(buf)
+    return paragraphs
+
+
+def _read_text_with_encoding_detect(file_path, console):
+    """读取文本文件，自动检测编码（UTF-8 -> GB18030 -> Latin-1）。
+
+    GB18030 是 GBK/GB2312 的超集，覆盖国内小说 TXT 的常见编码。
+    """
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except UnicodeDecodeError:
-        try:
-            with open(file_path, 'r', encoding='latin-1') as f:
-                content = f.read()
-        except Exception as e:
-            console.print(f"[bold red]Error: Failed to read TXT file: {e}[/bold red]")
-            return []
+        with open(file_path, 'rb') as f:
+            raw = f.read()
     except Exception as e:
         console.print(f"[bold red]Error: Failed to read TXT file: {e}[/bold red]")
+        return None
+
+    for encoding in ('utf-8-sig', 'gb18030'):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('latin-1', errors='replace')
+
+
+def _extract_content_txt(file_path, console):
+    content = _read_text_with_encoding_detect(file_path, console)
+    if content is None:
         return []
 
     # Normalize newlines to handle mixed cases
-    content = content.replace('\r\n', '\n')
-    
-    # Attempt to split by double newline first
-    paragraphs = [clean_visual_text(p.strip()) for p in content.split('\n\n') if p.strip()]
-    paragraphs = [p for p in paragraphs if p and len(p) > 3]
-    
-    # If that results in very few paragraphs (i.e., the whole file is one paragraph),
-    # and there are single newlines, then split by single newlines.
-    if len(paragraphs) <= 1 and '\n' in content:
-        paragraphs = [clean_visual_text(p.strip()) for p in content.split('\n') if p.strip()]
-        paragraphs = [p for p in paragraphs if p and len(p) > 3]
+    content = content.replace('\r\n', '\n').replace('\r', '\n')
 
-    if not paragraphs:
+    raw_lines = content.split('\n')
+    if not any(l.strip() for l in raw_lines):
         console.print("[bold red]No text content found in the TXT file.[/bold red]")
         return []
 
-    return [paragraphs]
+    # 段落切分策略：
+    # 1. 若文本几乎不换行（单行超长），按句子标点拆成段落，保证 h/l 可逐段跳转；
+    # 2. 若以中文为主且正文行不长（典型小说格式：一行一段），按行切分段落，
+    #    避免空行分段把整章内容合并成一个大段落（h/l 整章跳转的根因）；
+    # 3. 其余情况（英文排版文本等）保留空行分段逻辑。
+    cjk_lines = [l for l in raw_lines if re.search(r'[\u4e00-\u9fff]', l)]
+    is_chinese = len(cjk_lines) / len(raw_lines) > 0.5
+    cjk_avg_len = sum(len(l) for l in cjk_lines) / max(1, len(cjk_lines))
+
+    # 构建 (原文行号, 清洗后文本) 列表，空行剔除；
+    # 短行不在此处过滤，避免滤掉“尾声”“楔子”等两字章节标题
+    doc_lines = []
+    for i, line in enumerate(raw_lines):
+        text = clean_visual_text(line.strip())
+        if text:
+            doc_lines.append((i, text))
+
+    use_title_rule = True
+    if len(doc_lines) <= 1 and len(content) > _SENTENCE_PARAGRAPH_CHARS:
+        # 几乎没有换行：按句子拆段，此时行号与原文不再对应，无法用标题规则切章
+        sentence_paras = _split_long_text_into_paragraphs(doc_lines[0][1])
+        doc_lines = [(i, p) for i, p in enumerate(sentence_paras)]
+        doc_lines = [(i, t) for i, t in doc_lines if t and len(t) > 3]
+        use_title_rule = False
+    elif is_chinese and cjk_avg_len <= _AVG_LINE_AS_PARAGRAPH_LIMIT:
+        pass  # 行级段落：doc_lines 本身即“一行一段”
+    else:
+        # 空行分段：行号连续的行合并为一段，行号跳变（隔了空行）则新起一段
+        merged = []
+        cur = []
+        prev = None
+        for line_no, text in doc_lines:
+            if prev is not None and line_no == prev + 1:
+                cur.append(text)
+            else:
+                if cur:
+                    merged.append(" ".join(cur))
+                cur = [text]
+            prev = line_no
+        if cur:
+            merged.append(" ".join(cur))
+        doc_lines = [(i, t) for i, t in enumerate(merged)]
+        use_title_rule = False  # 合并后行号不再对应原文，交由字数兜底分章
+
+    if not doc_lines:
+        console.print("[bold red]No text content found in the TXT file.[/bold red]")
+        return []
+
+    # 章节识别：先尝试标题规则，匹配不到足够章节时按字数兜底
+    if use_title_rule:
+        rule = _pick_toc_rule(content[:_TOC_RULE_SAMPLE_SIZE])
+        if rule:
+            chapters = _split_txt_by_rule(content, doc_lines, rule)
+            if chapters:
+                return chapters
+
+    paragraphs = [text for _, text in doc_lines]
+    return _split_txt_by_size(paragraphs)
 
 
 def _extract_content_docx(file_path, console):
