@@ -170,6 +170,12 @@ def update_document_layout(reader):
         reader.position_to_line = cached['position_to_line']
         reader.paragraph_line_ranges = cached['paragraph_ranges']
     else:
+        # 换行结果按（段落文本, 宽度）内容寻址缓存：跨宽度重建时跳过
+        # rich 的逐段宽度测量（v 键切换卡顿的主要来源），只做轻量构造
+        wrap_cache = getattr(reader, '_wrap_cache', None)
+        if wrap_cache is None:
+            wrap_cache = reader._wrap_cache = {}
+
         reader.document_lines = []
         reader.line_to_position = {}
         reader.position_to_line = {}
@@ -182,31 +188,39 @@ def update_document_layout(reader):
             for para_idx, paragraph in enumerate(chapter):
                 paragraph_start_line = len(reader.document_lines)
 
-                plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-                wrapped_lines = plain_text.wrap(reader.console, available_width)
+                wrap_key = (paragraph, available_width)
+                cached_plain_lines = wrap_cache.get(wrap_key)
+                if cached_plain_lines is None:
+                    plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+                    wrapped_lines = plain_text.wrap(reader.console, available_width)
+                    wrap_cache[wrap_key] = [line.plain for line in wrapped_lines]
+                else:
+                    wrapped_lines = [
+                        Text(line, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+                        for line in cached_plain_lines
+                    ]
                 paragraph_end_line = len(reader.document_lines) + len(wrapped_lines) - 1
 
                 reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
 
                 sentences = content_parser.split_into_sentences(paragraph)
+                # 句子起点与换行位置都单调递增，用双指针线性定位句首所在行，
+                # 避免原实现的“每句从头扫描所有行”的 O(句数×行数) 开销
+                line_idx = 0
+                line_offset = 0
                 current_char_pos = 0
                 for sent_idx, sentence in enumerate(sentences):
                     sentence_start = current_char_pos
-                    sentence_end = current_char_pos + len(sentence)
-
-                    line_char_pos = 0
-                    for line_idx, line in enumerate(wrapped_lines):
-                        line_start = line_char_pos
-                        line_end = line_char_pos + len(line.plain)
-
-                        if line_start <= sentence_start < line_end:
-                            global_line_idx = paragraph_start_line + line_idx
-                            reader.position_to_line[(chap_idx, para_idx, sent_idx)] = global_line_idx
-                            break
-
-                        line_char_pos = line_end
-
-                    current_char_pos = sentence_end + 1
+                    while (
+                        line_idx < len(wrapped_lines)
+                        and sentence_start >= line_offset + len(wrapped_lines[line_idx].plain)
+                    ):
+                        line_offset += len(wrapped_lines[line_idx].plain)
+                        line_idx += 1
+                    if line_idx < len(wrapped_lines):
+                        global_line_idx = paragraph_start_line + line_idx
+                        reader.position_to_line[(chap_idx, para_idx, sent_idx)] = global_line_idx
+                    current_char_pos = sentence_start + len(sentence) + 1
 
                 for line_idx in range(len(wrapped_lines)):
                     global_line_idx = paragraph_start_line + line_idx

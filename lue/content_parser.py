@@ -8,6 +8,7 @@ from docx import Document
 from striprtf.striprtf import rtf_to_text
 import subprocess
 import string
+from functools import lru_cache
 from rich.console import Console
 from typing import List, Tuple
 from pathlib import Path
@@ -16,9 +17,15 @@ from html import unescape
 from urllib.parse import unquote
 
 
-def split_into_sentences(paragraph: str) -> list[str]:
+@lru_cache(maxsize=8192)
+def split_into_sentences(paragraph: str) -> tuple[str, ...]:
     """
     Splits a paragraph into sentences, intelligently handling common abbreviations and initials.
+
+    Results are cached (callers only read the result; the tuple is immutable).
+    Sentence splitting runs on every navigation key press and UI frame for the
+    current paragraph, and over all paragraphs when rebuilding layout, so the
+    cache removes a significant repeated cost for large books.
     """
     # A list of common English abbreviations that can be followed by a period.
     abbreviations = [

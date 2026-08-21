@@ -87,6 +87,9 @@ class Lue:
         self.line_to_position = {}
         self.position_to_line = {}
         self.paragraph_line_ranges = {}
+        # 换书后旧书的布局/换行缓存必须失效，否则会复用旧书内容
+        self._layout_cache = None
+        self._wrap_cache = None
         
         self.total_sentences = sum(
             len(content_parser.split_into_sentences(paragraph)) 
