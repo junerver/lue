@@ -18,7 +18,7 @@ except ImportError:
 from rich.console import Console
 from .reader import Lue
 from . import config, progress_manager, input_handler
-from .tts_manager import TTSManager, get_default_tts_model_name
+from .tts_manager import TTSManager
 
 def get_keyboard_shortcuts_file(keys_arg):
     """Resolve the keyboard shortcuts file path from the command line argument."""
@@ -137,7 +137,6 @@ async def main():
     
     tts_manager = TTSManager()
     available_tts = tts_manager.get_available_tts_names()
-    default_tts = get_default_tts_model_name(available_tts)
 
     parser = argparse.ArgumentParser(
         description="A terminal-based eBook reader with TTS",
@@ -183,14 +182,14 @@ async def main():
     )
     
     if available_tts:
-        # Add "none" option to available TTS choices
+        # 默认禁用 TTS(none):纯文本阅读秒开;需要朗读时显式 -t edge 等
         tts_choices = ["none"] + available_tts
         parser.add_argument(
             "-t",
             "--tts",
             choices=tts_choices,
-            default=default_tts,
-            help=f"Select the Text-to-Speech model. Use 'none' to disable TTS (default: {default_tts})",
+            default="none",
+            help=f"Select the Text-to-Speech model. Use 'none' to disable TTS (default: none)",
         )
         parser.add_argument(
             "-v",
@@ -276,15 +275,19 @@ async def main():
     setup_logging()
 
 
-    for tool in ['ffprobe', 'ffplay', 'ffmpeg']:
-        try:
-            subprocess.run([tool, '-version'], check=True, text=True, 
-                         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            console.print(f"\n[bold red]Error: {tool} not found.[/bold red] "
-                         "Please install FFmpeg and ensure it's in your system's PATH.")
-            logging.error(f"Required tool '{tool}' not found. FFmpeg may not be installed.")
-            sys.exit(1)
+    # ffmpeg 工具链只被 TTS 播放链路使用(ffplay 播音频、ffprobe 读时长);
+    # 纯文本阅读(-t none)用不到它们,跳过检查避免每次启动 3 次子进程。
+    tts_enabled = bool(available_tts) and hasattr(args, 'tts') and args.tts and args.tts != "none"
+    if tts_enabled:
+        for tool in ['ffprobe', 'ffplay', 'ffmpeg']:
+            try:
+                subprocess.run([tool, '-version'], check=True, text=True,
+                             stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                console.print(f"\n[bold red]Error: {tool} not found.[/bold red] "
+                             "Please install FFmpeg and ensure it's in your system's PATH.")
+                logging.error(f"Required tool '{tool}' not found. FFmpeg may not be installed.")
+                sys.exit(1)
 
     # Resolve keyboard shortcuts file
     # Prioritize command-line argument if explicitly provided (not the default)
@@ -302,7 +305,7 @@ async def main():
     input_handler.load_keyboard_shortcuts(keyboard_shortcuts_file)
     
     tts_instance = None
-    if available_tts and hasattr(args, 'tts') and args.tts and args.tts != "none":
+    if tts_enabled:
         voice = args.voice if hasattr(args, 'voice') else None
         lang = args.lang if hasattr(args, 'lang') else None
         tts_instance = tts_manager.create_model(args.tts, console, voice=voice, lang=lang)
