@@ -1,0 +1,18 @@
+[package]
+name = "lue_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust accelerator for the lue terminal eBook reader (text pipeline hot paths)"
+
+[lib]
+name = "lue_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+fancy-regex = "0.14"
+regex = "1.13.1"
+
+[profile.release]
+lto = true
+codegen-units = 1

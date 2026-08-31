@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "lue-rs"
+version = "0.1.0"
+description = "Rust accelerator for the lue terminal eBook reader (text pipeline hot paths)"
+requires-python = ">=3.10"
+
+[tool.maturin]
+module-name = "lue_rs"

@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import bisect
 import re
 import signal
 import logging
@@ -9,8 +10,44 @@ from rich.console import Console
 from rich.text import Text
 import platformdirs
 
-from . import config, content_parser, progress_manager, audio, ui, input_handler
+from . import config, content_parser, progress_manager, audio, ui, input_handler, _rust
 from .tts.base import TTSBase
+
+
+def _topmost_visible_sentence(position_to_line, sorted_index, top_visible_line, bottom_visible_line):
+    """Topmost sentence position for the viewport, via bisect over the
+    line-sorted index built by update_document_layout.
+
+    与原 O(全书) 双扫描逐语义一致:
+    - 视口内取最早行上插入序最早的句子位置;
+    - 视口为空时取视口之前最晚行上插入序最早的句子位置。
+    sorted_index 为 (positions, lines) 两个平行数组;无索引时(理论上不
+    发生,布局总是先建)退回线性扫描。
+    """
+    if not sorted_index:
+        positions, lines = None, None
+    else:
+        positions, lines = sorted_index
+
+    if positions is None:
+        last_pos_before_view = None
+        latest_line = -1
+        for pos, line_num in position_to_line.items():
+            if line_num < top_visible_line and line_num > latest_line:
+                latest_line = line_num
+                last_pos_before_view = pos
+        return last_pos_before_view
+
+    idx = bisect.bisect_left(lines, top_visible_line)
+    if idx < len(lines) and lines[idx] < bottom_visible_line:
+        return positions[idx]
+    # 视口内无句子:取视口之前最晚行的第一个条目
+    if idx > 0:
+        prev_line = lines[idx - 1]
+        return positions[bisect.bisect_left(lines, prev_line)]
+    # 视口之前无内容
+    return None
+
 
 class Lue:
     def __init__(self, file_path, tts_model: TTSBase | None, overlap: float | None = None):
@@ -92,12 +129,21 @@ class Lue:
         # 换书后旧书的布局/换行缓存必须失效，否则会复用旧书内容
         self._layout_cache = None
         self._wrap_cache = None
+        self._sorted_line_positions = None
         
-        self.total_sentences = sum(
-            len(content_parser.split_into_sentences(paragraph)) 
-            for chapter in self.chapters 
-            for paragraph in chapter
-        )
+        all_paragraphs = [p for chapter in self.chapters for p in chapter]
+        total = None
+        if _rust.lue_rs is not None:
+            try:
+                total = sum(len(s) for s in _rust.lue_rs.split_sentences_batch(all_paragraphs))
+            except _rust._PANIC_TYPES:
+                total = None
+        if total is None:
+            total = sum(
+                len(content_parser.split_into_sentences(paragraph))
+                for paragraph in all_paragraphs
+            )
+        self.total_sentences = total
         
         # Update document layout immediately after loading content
         ui.update_document_layout(self)
@@ -416,10 +462,23 @@ class Lue:
                 for sent_idx, sentence in enumerate(sentences):
                     sentence_positions.append((current_char, current_char + len(sentence), sent_idx))
                     current_char += len(sentence) + 1
-                wrapped_lines = Text(paragraph, justify="left", no_wrap=False).wrap(self.console, max(20, width - 10))
+                wrap_width = max(20, width - 10)
+                plain_wrapped = None
+                if _rust.lue_rs is not None:
+                    try:
+                        plain_wrapped = _rust.lue_rs.wrap_paragraph(paragraph, wrap_width)
+                    except _rust._PANIC_TYPES:
+                        plain_wrapped = None
+                if plain_wrapped is not None:
+                    wrapped_plains = plain_wrapped
+                else:
+                    wrapped_plains = [
+                        line.plain
+                        for line in Text(paragraph, justify="left", no_wrap=False).wrap(self.console, wrap_width)
+                    ]
                 line_offset = clicked_line - para_start
-                if 0 <= line_offset < len(wrapped_lines):
-                    char_pos_in_para = sum(len(line.plain) for line in wrapped_lines[:line_offset]) + min(content_x, len(wrapped_lines[line_offset].plain))
+                if 0 <= line_offset < len(wrapped_plains):
+                    char_pos_in_para = sum(len(line) for line in wrapped_plains[:line_offset]) + min(content_x, len(wrapped_plains[line_offset]))
                     for start_char, end_char, sent_idx in sentence_positions:
                         if start_char <= char_pos_in_para <= end_char:
                             return (chap_idx, para_idx, sent_idx)
@@ -811,25 +870,12 @@ class Lue:
         """Finds and returns the (c, p, s) of the topmost sentence in the viewport."""
         top_visible_line = int(self.scroll_offset)
         bottom_visible_line = top_visible_line + max(1, ui.get_terminal_size()[1] - 4)
-        topmost_sentence_pos = None
-        earliest_line = float('inf')
-
-        for pos, line_num in self.position_to_line.items():
-            if top_visible_line <= line_num < bottom_visible_line:
-                if line_num < earliest_line:
-                    earliest_line = line_num
-                    topmost_sentence_pos = pos
-        
-        if topmost_sentence_pos:
-            return topmost_sentence_pos
-
-        last_pos_before_view = None
-        latest_line = -1
-        for pos, line_num in self.position_to_line.items():
-            if line_num < top_visible_line and line_num > latest_line:
-                latest_line = line_num
-                last_pos_before_view = pos
-        return last_pos_before_view
+        return _topmost_visible_sentence(
+            self.position_to_line,
+            getattr(self, '_sorted_line_positions', None),
+            top_visible_line,
+            bottom_visible_line,
+        )
     
     def _calculate_progress_percentage(self):
         if self.total_sentences == 0: return 100.0

@@ -11,6 +11,7 @@ from rich.align import Align
 from rich import box
 from . import input_handler, config
 from . import content_parser
+from . import _rust
 
 # ================================
 # CENTRALIZED UI CONFIGURATION
@@ -169,6 +170,7 @@ def update_document_layout(reader):
         reader.line_to_position = cached['line_to_position']
         reader.position_to_line = cached['position_to_line']
         reader.paragraph_line_ranges = cached['paragraph_ranges']
+        reader._sorted_line_positions = cached['sorted_index']
     else:
         # 换行结果按（段落文本, 宽度）内容寻址缓存：跨宽度重建时跳过
         # rich 的逐段宽度测量（v 键切换卡顿的主要来源），只做轻量构造
@@ -191,14 +193,24 @@ def update_document_layout(reader):
                 wrap_key = (paragraph, available_width)
                 cached_plain_lines = wrap_cache.get(wrap_key)
                 if cached_plain_lines is None:
-                    plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-                    wrapped_lines = plain_text.wrap(reader.console, available_width)
-                    wrap_cache[wrap_key] = [line.plain for line in wrapped_lines]
-                else:
-                    wrapped_lines = [
-                        Text(line, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-                        for line in cached_plain_lines
-                    ]
+                    # Rust 加速的 wrap 与 rich Text.wrap 逐字节等价
+                    # （tests/test_rust_parity.py 全量对比），失败时回退 rich
+                    if _rust.lue_rs is not None:
+                        try:
+                            cached_plain_lines = _rust.lue_rs.wrap_paragraph(
+                                paragraph, available_width
+                            )
+                        except _rust._PANIC_TYPES:
+                            cached_plain_lines = None
+                    if cached_plain_lines is None:
+                        plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+                        wrapped_lines = plain_text.wrap(reader.console, available_width)
+                        cached_plain_lines = [line.plain for line in wrapped_lines]
+                    wrap_cache[wrap_key] = cached_plain_lines
+                wrapped_lines = [
+                    Text(line, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+                    for line in cached_plain_lines
+                ]
                 paragraph_end_line = len(reader.document_lines) + len(wrapped_lines) - 1
 
                 reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
@@ -233,11 +245,21 @@ def update_document_layout(reader):
 
         if cache is None:
             cache = reader._layout_cache = {}
+        # 按行排序的 (positions, lines) 平行数组:_get_topmost_visible_sentence
+        # 用二分替代 O(全书句子) 的 dict 扫描;稳定排序保持插入序,同一行的
+        # 多个句子位置中取插入最早的那个,与原扫描语义一致
+        sorted_items = sorted(reader.position_to_line.items(), key=lambda kv: kv[1])
+        sorted_index = (
+            [pos for pos, _ in sorted_items],
+            [ln for _, ln in sorted_items],
+        )
+        reader._sorted_line_positions = sorted_index
         cache[available_width] = {
             'lines': reader.document_lines,
             'line_to_position': reader.line_to_position,
             'position_to_line': reader.position_to_line,
             'paragraph_ranges': reader.paragraph_line_ranges,
+            'sorted_index': sorted_index,
         }
         # 只保留最近使用的两个宽度，避免终端频繁 resize 时内存无限增长
         if len(cache) > 2:

@@ -16,6 +16,8 @@ from html.parser import HTMLParser
 from html import unescape
 from urllib.parse import unquote
 
+from . import _rust
+
 
 @lru_cache(maxsize=8192)
 def split_into_sentences(paragraph: str) -> tuple[str, ...]:
@@ -27,6 +29,15 @@ def split_into_sentences(paragraph: str) -> tuple[str, ...]:
     current paragraph, and over all paragraphs when rebuilding layout, so the
     cache removes a significant repeated cost for large books.
     """
+    if _rust.lue_rs is not None:
+        try:
+            return _rust.lue_rs.split_sentences(paragraph)
+        except _rust._PANIC_TYPES:
+            pass  # fall back to the pure-Python implementation
+    return _split_into_sentences_py(paragraph)
+
+
+def _split_into_sentences_py(paragraph: str) -> list[str]:
     # A list of common English abbreviations that can be followed by a period.
     abbreviations = [
         "Mr", "Mrs", "Ms", "Dr", "Prof", "Rev", "Hon", "Jr", "Sr",
@@ -126,7 +137,7 @@ def clean_visual_text(text):
     """
     if not text or not isinstance(text, str):
         return text
-    
+
     # Check if this is a code block line - if so, preserve it mostly as-is
     if text.startswith('__CODE_BLOCK__'):
         # Remove the marker and preserve the content with NO cleaning
@@ -134,7 +145,16 @@ def clean_visual_text(text):
 
         # Preserve all formatting, spaces, and special characters for code
         return code_content
-    
+
+    if _rust.lue_rs is not None:
+        try:
+            return _rust.lue_rs.clean_visual_text(text)
+        except _rust._PANIC_TYPES:
+            pass  # fall back to the pure-Python implementation
+    return _clean_visual_text_py(text)
+
+
+def _clean_visual_text_py(text):
     # 1. Handle spaced dots - collapse patterns like " . . . " to "..."
     # First, handle sequences of 3 or more dots with any amount of spacing
     text = re.sub(r'\s*\.\s*\.\s*\.\s*(\.\s*)*', '...', text)  # " . . . " or more -> "..."
@@ -779,6 +799,12 @@ def _pick_toc_rule(sample):
     不足 100 字符算一次误报；有效章节数需 >= 误报数*3，且比当前最优规则
     多出 _TOC_RULE_OVERSHOOT 个才算胜出。
     """
+    if _rust.lue_rs is not None:
+        try:
+            idx = _rust.lue_rs.pick_toc_rule(sample)
+            return None if idx is None else TXT_TOC_RULES[idx]
+        except _rust._PANIC_TYPES:
+            pass  # fall back to the pure-Python implementation
     best_count = -1
     best_rule = None
     for rule in TXT_TOC_RULES:
@@ -803,6 +829,12 @@ def _pick_toc_rule(sample):
 
 def _collect_title_lines(content, rule):
     """返回规则在原文中匹配到的标题所在行号（0 基，按原文行计算）。"""
+    if _rust.lue_rs is not None:
+        try:
+            idx = TXT_TOC_RULES.index(rule)
+            return set(_rust.lue_rs.collect_title_lines(content, idx))
+        except _rust._PANIC_TYPES:
+            pass  # fall back to the pure-Python implementation
     line_starts = []
     pos = 0
     for line in content.split('\n'):
@@ -868,6 +900,11 @@ def _split_txt_by_size(lines, max_chars=_TOC_FALLBACK_CHAPTER_CHARS):
 
 def _split_long_text_into_paragraphs(text, max_chars=_SENTENCE_PARAGRAPH_CHARS):
     """整段无换行的超长文本：按句子标点拆分为多个段落。"""
+    if _rust.lue_rs is not None:
+        try:
+            return _rust.lue_rs.split_long_text_paragraphs(text, max_chars)
+        except _rust._PANIC_TYPES:
+            pass  # fall back to the pure-Python implementation
     parts = re.split(r'(?<=[。！？!?；;])', text)
     paragraphs = []
     buf = ""
@@ -922,17 +959,33 @@ def _extract_content_txt(file_path, console):
     # 2. 若以中文为主且正文行不长（典型小说格式：一行一段），按行切分段落，
     #    避免空行分段把整章内容合并成一个大段落（h/l 整章跳转的根因）；
     # 3. 其余情况（英文排版文本等）保留空行分段逻辑。
-    cjk_lines = [l for l in raw_lines if re.search(r'[\u4e00-\u9fff]', l)]
-    is_chinese = len(cjk_lines) / len(raw_lines) > 0.5
-    cjk_avg_len = sum(len(l) for l in cjk_lines) / max(1, len(cjk_lines))
+    rust_ok = False
+    if _rust.lue_rs is not None:
+        try:
+            cjk_count, cjk_total = _rust.lue_rs.analyze_cjk(content)
+            is_chinese = cjk_count / len(raw_lines) > 0.5
+            cjk_avg_len = cjk_total / max(1, cjk_count)
+            rust_ok = True
+        except _rust._PANIC_TYPES:
+            rust_ok = False
+    if not rust_ok:
+        cjk_lines = [l for l in raw_lines if re.search(r'[\u4e00-\u9fff]', l)]
+        is_chinese = len(cjk_lines) / len(raw_lines) > 0.5
+        cjk_avg_len = sum(len(l) for l in cjk_lines) / max(1, len(cjk_lines))
 
     # 构建 (原文行号, 清洗后文本) 列表，空行剔除；
     # 短行不在此处过滤，避免滤掉“尾声”“楔子”等两字章节标题
     doc_lines = []
-    for i, line in enumerate(raw_lines):
-        text = clean_visual_text(line.strip())
-        if text:
-            doc_lines.append((i, text))
+    if _rust.lue_rs is not None:
+        try:
+            doc_lines = [(i, t) for i, t in _rust.lue_rs.clean_txt_doc_lines(content) if t]
+        except _rust._PANIC_TYPES:
+            doc_lines = []
+    if not doc_lines:
+        for i, line in enumerate(raw_lines):
+            text = clean_visual_text(line.strip())
+            if text:
+                doc_lines.append((i, text))
 
     use_title_rule = True
     if len(doc_lines) <= 1 and len(content) > _SENTENCE_PARAGRAPH_CHARS:
