@@ -451,7 +451,10 @@ def test_parity_update_document_layout(tmp_path, monkeypatch):
         monkeypatch.setattr(ui.config, "UI_MODE", 0)
         monkeypatch.setattr(ui, "get_terminal_size", lambda: (100, 40))
         ui.update_document_layout(reader)
-        results[backend] = [line.plain for line in reader.document_lines]
+        # document_lines now stores plain strings (Text reconstructed on render)
+        results[backend] = [
+            line.plain if hasattr(line, "plain") else line for line in reader.document_lines
+        ]
         results[backend + "_map"] = dict(reader.position_to_line)
 
     assert results["rust"] == results["rich"]

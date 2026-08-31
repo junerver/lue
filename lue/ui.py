@@ -12,6 +12,7 @@ from rich import box
 from . import input_handler, config
 from . import content_parser
 from . import _rust
+from . import cache as cache_mod
 
 # ================================
 # CENTRALIZED UI CONFIGURATION
@@ -165,58 +166,69 @@ def update_document_layout(reader):
 
     cache = getattr(reader, '_layout_cache', None)
     cached = cache.get(available_width) if cache else None
+    disk_layout = None
+    if not cached:
+        # 布局磁盘缓存:同一书在同一宽度下跳过整书 wrap 重建(v 键/resize
+        # 切换宽度会重建一次并写回;书内容变化按 mtime+size 失效)
+        try:
+            disk_layout = cache_mod.LayoutCache(
+                reader.file_path,
+                cache_mod.LayoutCache.key_for(os.stat(reader.file_path), available_width),
+            ).load()
+        except Exception:
+            disk_layout = None
     if cached:
         reader.document_lines = cached['lines']
         reader.line_to_position = cached['line_to_position']
         reader.position_to_line = cached['position_to_line']
         reader.paragraph_line_ranges = cached['paragraph_ranges']
         reader._sorted_line_positions = cached['sorted_index']
+    elif disk_layout is not None:
+        # 与 rebuild 一致:document_lines 存普通 str,渲染时才转 Text
+        reader.document_lines = disk_layout['lines']
+        reader.line_to_position = disk_layout['line_to_position']
+        reader.position_to_line = disk_layout['position_to_line']
+        reader.paragraph_line_ranges = disk_layout['paragraph_ranges']
+        reader._sorted_line_positions = disk_layout['sorted_index']
     else:
-        # 换行结果按（段落文本, 宽度）内容寻址缓存：跨宽度重建时跳过
-        # rich 的逐段宽度测量（v 键切换卡顿的主要来源），只做轻量构造
-        wrap_cache = getattr(reader, '_wrap_cache', None)
-        if wrap_cache is None:
-            wrap_cache = reader._wrap_cache = {}
-
+        # 布局重建:整章批量 wrap(一次 FFI 调用,替代逐段 dict 查找);
+        # document_lines 先存普通行文本(缓存与二分子结构都更轻),
+        # 需要渲染时才在 get_visible_content 转成 Text。
+        blank_text = Text("", style=COLORS.TEXT_NORMAL)
         reader.document_lines = []
         reader.line_to_position = {}
         reader.position_to_line = {}
         reader.paragraph_line_ranges = {}
 
+        wrap_paragraph = (
+            _rust.lue_rs.wrap_paragraph
+            if _rust.lue_rs is not None
+            else None
+        )
+
         for chap_idx, chapter in enumerate(reader.chapters):
             if chap_idx > 0:
-                reader.document_lines.append(Text("", style=COLORS.TEXT_NORMAL))
+                reader.document_lines.append("")
 
             for para_idx, paragraph in enumerate(chapter):
                 paragraph_start_line = len(reader.document_lines)
 
-                wrap_key = (paragraph, available_width)
-                cached_plain_lines = wrap_cache.get(wrap_key)
-                if cached_plain_lines is None:
-                    # Rust 加速的 wrap 与 rich Text.wrap 逐字节等价
-                    # （tests/test_rust_parity.py 全量对比），失败时回退 rich
-                    if _rust.lue_rs is not None:
-                        try:
-                            cached_plain_lines = _rust.lue_rs.wrap_paragraph(
-                                paragraph, available_width
-                            )
-                        except _rust._PANIC_TYPES:
-                            cached_plain_lines = None
-                    if cached_plain_lines is None:
-                        plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-                        wrapped_lines = plain_text.wrap(reader.console, available_width)
-                        cached_plain_lines = [line.plain for line in wrapped_lines]
-                    wrap_cache[wrap_key] = cached_plain_lines
-                wrapped_lines = [
-                    Text(line, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-                    for line in cached_plain_lines
-                ]
-                paragraph_end_line = len(reader.document_lines) + len(wrapped_lines) - 1
+                if wrap_paragraph is not None:
+                    try:
+                        wrapped_plains = wrap_paragraph(paragraph, available_width)
+                    except _rust._PANIC_TYPES:
+                        wrapped_plains = None
+                else:
+                    wrapped_plains = None
+                if wrapped_plains is None:
+                    plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+                    wrapped_plains = [line.plain for line in plain_text.wrap(reader.console, available_width)]
 
+                paragraph_end_line = paragraph_start_line + len(wrapped_plains) - 1
                 reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
 
                 sentences = content_parser.split_into_sentences(paragraph)
-                # 句子起点与换行位置都单调递增，用双指针线性定位句首所在行，
+                # 句子起点与换行位置都单调递增,用双指针线性定位句首所在行,
                 # 避免原实现的“每句从头扫描所有行”的 O(句数×行数) 开销
                 line_idx = 0
                 line_offset = 0
@@ -224,24 +236,22 @@ def update_document_layout(reader):
                 for sent_idx, sentence in enumerate(sentences):
                     sentence_start = current_char_pos
                     while (
-                        line_idx < len(wrapped_lines)
-                        and sentence_start >= line_offset + len(wrapped_lines[line_idx].plain)
+                        line_idx < len(wrapped_plains)
+                        and sentence_start >= line_offset + len(wrapped_plains[line_idx])
                     ):
-                        line_offset += len(wrapped_lines[line_idx].plain)
+                        line_offset += len(wrapped_plains[line_idx])
                         line_idx += 1
-                    if line_idx < len(wrapped_lines):
-                        global_line_idx = paragraph_start_line + line_idx
-                        reader.position_to_line[(chap_idx, para_idx, sent_idx)] = global_line_idx
+                    if line_idx < len(wrapped_plains):
+                        reader.position_to_line[(chap_idx, para_idx, sent_idx)] = paragraph_start_line + line_idx
                     current_char_pos = sentence_start + len(sentence) + 1
 
-                for line_idx in range(len(wrapped_lines)):
-                    global_line_idx = paragraph_start_line + line_idx
-                    reader.line_to_position[global_line_idx] = (chap_idx, para_idx, 0)
+                for line_idx in range(len(wrapped_plains)):
+                    reader.line_to_position[paragraph_start_line + line_idx] = (chap_idx, para_idx, 0)
 
-                reader.document_lines.extend(wrapped_lines)
+                reader.document_lines.extend(wrapped_plains)
 
                 if para_idx < len(chapter) - 1:
-                    reader.document_lines.append(Text("", style=COLORS.TEXT_NORMAL))
+                    reader.document_lines.append("")
 
         if cache is None:
             cache = reader._layout_cache = {}
@@ -261,6 +271,27 @@ def update_document_layout(reader):
             'paragraph_ranges': reader.paragraph_line_ranges,
             'sorted_index': sorted_index,
         }
+        # 持久化布局缓存(后台线程写盘,不阻塞渲染也不依赖事件循环
+        # 状态;asyncio.get_event_loop 在无事件循环的同步加载期会抛错)
+        try:
+            import threading
+
+            layout_payload = cache[available_width]
+
+            def _persist_layout():
+                try:
+                    cache_mod.LayoutCache(
+                        reader.file_path,
+                        cache_mod.LayoutCache.key_for(
+                            os.stat(reader.file_path), available_width
+                        ),
+                    ).store(layout_payload)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_persist_layout, daemon=True).start()
+        except Exception:
+            pass
         # 只保留最近使用的两个宽度，避免终端频繁 resize 时内存无限增长
         if len(cache) > 2:
             for old_width in sorted(cache.keys())[:-2]:
@@ -335,13 +366,18 @@ def render_speed_reading_output(reader, width, height, console):
 
 
 def _apply_current_text_color(line):
-    """Apply the current theme's text color to a line."""
+    """Apply the current theme's text color to a line.
+
+    document_lines 现在存普通 str(布局重建/磁盘缓存均不建 Text),渲染
+    前在 get_visible_content 统一转 Text;这里同时兼容两者。
+    """
+    if isinstance(line, str):
+        if not line:
+            return Text("", style=COLORS.TEXT_NORMAL)
+        return Text(line, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
     if not line.plain:
         return Text("", style=COLORS.TEXT_NORMAL)
-    
-    # Create a new Text object with current theme color
-    new_line = Text(line.plain, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-    return new_line
+    return Text(line.plain, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
 
 
 def get_visible_content(reader):
@@ -465,6 +501,8 @@ def _apply_selection_highlighting(reader, line, line_index):
     """Apply selection highlighting to a line if it's within the selection range."""
     if not reader.selection_active or not reader.selection_start or not reader.selection_end:
         return line
+    if isinstance(line, str):
+        line = Text(line, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
     
     start_line, start_char = reader.selection_start
     end_line, end_char = reader.selection_end

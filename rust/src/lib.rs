@@ -450,7 +450,12 @@ pub fn pick_toc_rule_impl(sample: &str) -> Option<usize> {
     if let Some(fast0) = fast_toc_regexes().get(0).and_then(|o| o.as_ref()) {
         let shifted: Vec<(usize, usize)> = fast0
             .find_iter(sample)
-            .map(|m| {
+            // regex crate 在此输入上可能返回非字符边界的 match 偏移
+            // (全角空格与 \s 组合的已知边界问题),跳过而非切片 panic
+            .filter_map(|m| {
+                if !sample.is_char_boundary(m.start()) || !sample.is_char_boundary(m.end()) {
+                    return None;
+                }
                 // 前缀 (?:[　\s]) 已匹配一个字符;“第”的起始 = 该字符的
                 // 结束偏移。不能用 m.start()+1(全角空格 3 字节会踩到
                 // 字符内部),按实际 UTF-8 长度推进。
@@ -458,7 +463,7 @@ pub fn pick_toc_rule_impl(sample: &str) -> Option<usize> {
                     .chars()
                     .next()
                     .map_or(0, |c| c.len_utf8());
-                (m.start() + head_len, m.end())
+                Some((m.start() + head_len, m.end()))
             })
             .collect();
         if !shifted.is_empty() {

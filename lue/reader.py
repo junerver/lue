@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.text import Text
 import platformdirs
 
-from . import config, content_parser, progress_manager, audio, ui, input_handler, _rust
+from . import config, content_parser, progress_manager, audio, ui, input_handler, _rust, cache
 from .tts.base import TTSBase
 
 
@@ -111,17 +111,51 @@ class Lue:
         """Load and process the document content."""
         if not quiet:
             self.console.print(f"[bold cyan]Loading document: {self.book_title}...[/bold cyan]")
-        self.chapters = content_parser.extract_content(self.file_path, self.console)
-        
-        # Check if any content was extracted
-        if not self.chapters or not any(chapter for chapter in self.chapters):
-            self.console.print(f"[bold red]Error: No text could be extracted from the file.[/bold red]")
-            self.console.print("This might happen with image-based PDFs or unsupported formats.")
-            sys.exit(1)
-            
+
+        # 磁盘缓存:同一文件(mtime+size 不变)跳过解析与句子统计。
+        # 命中后仍需重建布局(按宽度),但那由 update_document_layout
+        # 的布局缓存覆盖;缓存损坏/不匹配一律回退完整解析。
+        cache_hit = False
+        try:
+            stat = os.stat(self.file_path)
+            self._parsed_cache = cache.ParsedBookCache(self.file_path, cache.ParsedBookCache.key_for(stat))
+            loaded = self._parsed_cache.load()
+            if loaded is not None:
+                self.chapters, self.total_sentences = loaded
+                cache_hit = True
+        except Exception:
+            loaded = None
+
+        if not cache_hit:
+            self.chapters = content_parser.extract_content(self.file_path, self.console)
+
+            # Check if any content was extracted
+            if not self.chapters or not any(chapter for chapter in self.chapters):
+                self.console.print(f"[bold red]Error: No text could be extracted from the file.[/bold red]")
+                self.console.print("This might happen with image-based PDFs or unsupported formats.")
+                sys.exit(1)
+
+            all_paragraphs = [p for chapter in self.chapters for p in chapter]
+            total = None
+            if _rust.lue_rs is not None:
+                try:
+                    total = sum(len(s) for s in _rust.lue_rs.split_sentences_batch(all_paragraphs))
+                except _rust._PANIC_TYPES:
+                    total = None
+            if total is None:
+                total = sum(
+                    len(content_parser.split_into_sentences(paragraph))
+                    for paragraph in all_paragraphs
+                )
+            self.total_sentences = total
+            try:
+                self._parsed_cache.store(self.chapters, self.total_sentences)
+            except Exception:
+                pass
+
         if not quiet:
             self.console.print(f"[green]Document loaded successfully![/green]")
-        
+
         self.document_lines = []
         self.line_to_position = {}
         self.position_to_line = {}
@@ -130,21 +164,7 @@ class Lue:
         self._layout_cache = None
         self._wrap_cache = None
         self._sorted_line_positions = None
-        
-        all_paragraphs = [p for chapter in self.chapters for p in chapter]
-        total = None
-        if _rust.lue_rs is not None:
-            try:
-                total = sum(len(s) for s in _rust.lue_rs.split_sentences_batch(all_paragraphs))
-            except _rust._PANIC_TYPES:
-                total = None
-        if total is None:
-            total = sum(
-                len(content_parser.split_into_sentences(paragraph))
-                for paragraph in all_paragraphs
-            )
-        self.total_sentences = total
-        
+
         # Update document layout immediately after loading content
         ui.update_document_layout(self)
 
@@ -498,7 +518,8 @@ class Lue:
             
         # Clamp content_x to the actual line length
         if clicked_line < len(self.document_lines):
-            line_text = self.document_lines[clicked_line].plain
+            line_obj = self.document_lines[clicked_line]
+            line_text = line_obj.plain if hasattr(line_obj, "plain") else line_obj
             content_x = min(content_x, len(line_text))
         
         return (clicked_line, content_x)
@@ -684,7 +705,8 @@ class Lue:
             if line_idx >= len(self.document_lines):
                 break
                 
-            line_text = self.document_lines[line_idx].plain
+            line_obj = self.document_lines[line_idx]
+            line_text = line_obj.plain if hasattr(line_obj, "plain") else line_obj
             
             if start_line == end_line:
                 # Single line selection
