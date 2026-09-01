@@ -284,6 +284,9 @@ class Lue:
 
     def _initialize_progress(self):
         """Initialize reading progress from saved state."""
+        # 旧版把中文书名净化成空串,进度写在隐藏的 .progress.json 里;
+        # 属于本书则先迁移到新书名文件,避免升级后阅读位置丢失。
+        progress_manager.maybe_migrate_legacy_progress(self.progress_file, self.file_path)
         progress_data = progress_manager.load_extended_progress(self.progress_file)
         c, p, s = progress_data["c"], progress_data["p"], progress_data["s"]
         

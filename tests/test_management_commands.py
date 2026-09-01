@@ -91,3 +91,66 @@ def test_clear_cli_reports_scope(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Cleared 1 reading record(s)" in out
     assert book.exists()
+
+
+def test_cjk_title_does_not_create_dotfile(tmp_path, monkeypatch):
+    """A Chinese book title must produce a visible progress filename, not a
+    dotfile that glob()/scandir filters would miss."""
+    monkeypatch.setattr(config, "PROGRESS_FILE_DIR", str(tmp_path))
+    path = progress_manager.get_progress_file_path("魅力")
+    assert os.path.basename(path) == "魅力.progress.json"
+    assert os.path.basename(path) != ".progress.json"
+    # writing + listing must see it
+    book = tmp_path / "魅力.txt"
+    book.write_text("x", encoding="utf-8")
+    write_record(tmp_path, "魅力", book, 33.0)
+    records = progress_manager.list_read_books()
+    assert [r["title"] for r in records] == ["魅力"]
+
+
+def test_dotfile_progress_records_are_listed(tmp_path, monkeypatch):
+    """Legacy records written to .progress.json (old CJK sanitizer) must
+    still appear in list and be cleared by clear."""
+    monkeypatch.setattr(config, "PROGRESS_FILE_DIR", str(tmp_path))
+    book = tmp_path / "魅力.txt"
+    book.write_text("x", encoding="utf-8")
+    legacy = tmp_path / ".progress.json"
+    legacy.write_text(json.dumps({
+        "original_file_path": str(book),
+        "completion_percentage": 60.0,
+    }), encoding="utf-8")
+    records = progress_manager.list_read_books()
+    assert [r["title"] for r in records] == ["魅力"]
+    assert records[0]["percentage"] == 60.0
+    result = progress_manager.clear_reading_data()
+    assert result["progress"] == 1
+    assert not legacy.exists()
+
+
+def test_legacy_progress_migrates_to_new_title_file(tmp_path, monkeypatch):
+    """Opening the same book after the naming fix must pull its position
+    from the legacy .progress.json into the new per-title file."""
+    monkeypatch.setattr(config, "PROGRESS_FILE_DIR", str(tmp_path))
+    book = tmp_path / "魅力.txt"
+    book.write_text("x", encoding="utf-8")
+    legacy = tmp_path / ".progress.json"
+    legacy.write_text(json.dumps({
+        "original_file_path": str(book),
+        "completion_percentage": 63.6,
+        "c": 545, "p": 0, "s": 0,
+    }), encoding="utf-8")
+
+    new_path = progress_manager.get_progress_file_path("魅力")
+    assert os.path.basename(new_path) == "魅力.progress.json"
+    assert progress_manager.maybe_migrate_legacy_progress(new_path, str(book)) is True
+    assert not legacy.exists()
+    assert new_path == progress_manager.get_progress_file_path("魅力")
+    # Other books must not steal the legacy record.
+    other = progress_manager.get_progress_file_path("高考")
+    other_book = tmp_path / "高考.txt"
+    other_book.write_text("x", encoding="utf-8")
+    other_legacy = tmp_path / ".progress.json"
+    other_legacy.write_text(json.dumps({
+        "original_file_path": str(other_book),
+    }), encoding="utf-8")
+    assert progress_manager.maybe_migrate_legacy_progress(other, str(other_book)) is True

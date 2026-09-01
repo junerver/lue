@@ -4,22 +4,59 @@ import os
 import json
 import re
 import glob
+import shutil
 from . import config
 from . import content_parser
+
+# Legacy records were written to this fixed name when a CJK book title was
+# sanitized to an empty string (see get_progress_file_path history).
+LEGACY_PROGRESS_FILE = ".progress.json"
 
 
 def get_progress_file_path(book_title):
     """
     Generate the file path for storing reading progress.
-    
+
+    CJK is common in book titles, so the safe name must keep Unicode letters
+    and digits (not just ASCII) — otherwise a Chinese title like 魅力 would
+    sanitize to an empty string and the record would be written to a
+    dotfile (.progress.json) that glob() cannot see.
+
     Args:
         book_title: Title of the book
-        
+
     Returns:
         str: Full path to the progress file
     """
-    safe_title = re.sub(r'[^A-Za-z0-9]+', '', book_title)
+    safe_title = re.sub(r'[^0-9A-Za-z\u4e00-\u9fff_]+', '', book_title or '')
+    if not safe_title:
+        # Absolute fallback: never write an invisible dotfile.
+        safe_title = 'book'
     return os.path.join(config.PROGRESS_FILE_DIR, f"{safe_title}.progress.json")
+
+def maybe_migrate_legacy_progress(progress_file, original_file_path):
+    """Upgrade a pre-windowing CJK record to the new per-title filename.
+
+    Old versions sanitized CJK titles to an empty string, so the record for
+    e.g. 魅力.txt lived at `.progress.json`. When the per-title file is
+    missing and the legacy record belongs to this exact book, move it so the
+    reading position survives the naming fix.
+    """
+    if progress_file == os.path.join(config.PROGRESS_FILE_DIR, LEGACY_PROGRESS_FILE):
+        return False
+    legacy_path = os.path.join(config.PROGRESS_FILE_DIR, LEGACY_PROGRESS_FILE)
+    if not os.path.exists(legacy_path) or os.path.exists(progress_file):
+        return False
+    try:
+        with open(legacy_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get("original_file_path") != original_file_path:
+            return False
+        shutil.move(legacy_path, progress_file)
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
+
 
 def load_progress(progress_file):
     """
@@ -135,6 +172,22 @@ def save_extended_progress(progress_file, chapter_idx, paragraph_idx, sentence_i
         json.dump(progress, f, indent=2)
     os.replace(tmp_file, progress_file)
 
+def _iter_progress_files():
+    """Yield every progress record file, including dotfiles.
+
+    Older versions sanitized CJK titles to an empty string, so records were
+    written to `.progress.json` (a dotfile that `glob("*.progress.json")`
+    misses). Scanning the directory instead keeps those records visible.
+    """
+    try:
+        with os.scandir(config.PROGRESS_FILE_DIR) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith(".progress.json"):
+                    yield entry.path
+    except FileNotFoundError:
+        return
+
+
 def list_read_books():
     """Return every readable saved-book record, newest first.
 
@@ -142,7 +195,7 @@ def list_read_books():
     limit. Each record includes the progress-file timestamp so the CLI can
     present a stable history.
     """
-    progress_files = glob.glob(os.path.join(config.PROGRESS_FILE_DIR, "*.progress.json"))
+    progress_files = list(_iter_progress_files())
     progress_files.sort(key=os.path.getmtime, reverse=True)
 
     records = []
@@ -181,7 +234,7 @@ def clear_reading_data():
     """
     result = {"progress": 0, "parsed": 0, "txt_index": 0, "errors": []}
 
-    for pf in glob.glob(os.path.join(config.PROGRESS_FILE_DIR, "*.progress.json")):
+    for pf in _iter_progress_files():
         try:
             os.remove(pf)
             result["progress"] += 1
@@ -240,7 +293,7 @@ def find_most_recent_book():
     Returns:
         str or None: Path to the most recently read book, or None if no books found
     """
-    progress_files = glob.glob(os.path.join(config.PROGRESS_FILE_DIR, "*.progress.json"))
+    progress_files = list(_iter_progress_files())
     
     if not progress_files:
         return None
