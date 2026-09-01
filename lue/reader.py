@@ -142,6 +142,8 @@ class Lue:
                     intro_first = idx["intro_first"]
                 from .lazy_book import LazyChapters
                 self.chapters = LazyChapters(self.file_path, encoding, starts, ends, intro_first)
+                # 供 ui.build_window_layout 直接使用 Rust 句柄做窗口布局
+                self._lazy_book = self.chapters
                 cache_hit = True
             except Exception:
                 cache_hit = False
@@ -294,8 +296,17 @@ class Lue:
         self.ui_word_idx = 0  # Current word index for word-level highlighting
 
         # 窗口化布局:存储的 scroll_offset 是旧的全书行号,窗口化后无意义。
-        # 先让窗口覆盖进度所在章,再在窗口内重算滚动位置。
-        self._ensure_window(self.chapter_idx)
+        # 手动滚动锚点(可能位于保存的朗读章之外)优先决定窗口中心,否则
+        # 以恢复的阅读位置为中心,再在窗口内重算滚动位置。
+        manual_anchor = progress_data.get("manual_scroll_anchor")
+        if manual_anchor:
+            anchor_chapter = tuple(manual_anchor)[0]
+            if 0 <= anchor_chapter < len(self.chapters):
+                self._ensure_window(anchor_chapter)
+            else:
+                self._ensure_window(self.chapter_idx)
+        else:
+            self._ensure_window(self.chapter_idx)
 
         self.auto_scroll_enabled = progress_data["auto_scroll_enabled"]
         if getattr(config, "UI_MODE_OVERRIDE", False):
@@ -314,7 +325,6 @@ class Lue:
         _, height = ui.get_terminal_size()
         available_height = max(1, height - 4)
         target_line = None
-        manual_anchor = progress_data.get("manual_scroll_anchor")
         if manual_anchor:
             anchor_pos = tuple(manual_anchor)
             if anchor_pos in self.position_to_line:
@@ -1103,24 +1113,46 @@ class Lue:
                 await audio.play_from_current_position(self)
 
     def _slide_window(self, direction):
-        """页滚动越过窗口边界时窗口前/后退一章,返回视口需回退的行数偏移。"""
+        """页滚动越过窗口边界时窗口前/后退一章,并用全局视口锚点保持连续。
+
+        滑动前记录当前视口顶部附近的全局句子位置;重建窗口后把这个全局
+        位置映射到新窗口的行号,再据此设视口偏移,避免依赖对"第二章行数"
+        的猜测。
+        """
         base = getattr(self, '_window_base', 0)
         end = getattr(self, '_window_end', 0)
         new_center = (base if direction < 0 else end - 1) + direction
         new_center = max(0, min(len(self.chapters) - 1, new_center))
         if new_center == base and direction < 0:
             new_center = max(0, base - 1)
-        old_base = base
+
+        # 锚点:视口顶行对应的全局句子位置 + 在视口内的行内偏移
+        top_line = int(self.scroll_offset)
+        anchor_pos = self._position_at_line(top_line)
+        page_size = max(1, ui.get_terminal_size()[1] - 4)
+        line_within_viewport = top_line - (int(self.scroll_offset))
+
         ui.build_window_layout(self, new_center)
-        if direction < 0:
-            # 视口保持在(原窗口首章在新窗口中)的相同位置
-            return 0
-        # 前进:原窗口第二章成为新窗口首章,视口上移其行数
-        moved = 0
-        rng = self.paragraph_line_ranges.get((old_base + 1, 0)) if old_base + 1 < len(self.chapters) else None
-        if rng:
-            moved = rng[0]
-        return moved
+
+        # 锚点映射到新窗口:取锚点的行号,再叠加原视口内偏移
+        if anchor_pos is not None and anchor_pos in self.position_to_line:
+            anchor_line = self.position_to_line[anchor_pos]
+            new_scroll = max(0, anchor_line - line_within_viewport)
+        else:
+            new_scroll = self.scroll_offset
+        max_scroll = max(0, len(self.document_lines) - page_size)
+        return min(new_scroll, max_scroll)
+
+    def _position_at_line(self, line):
+        """返回行号 line 对应的全局 (c,p,s) 位置,找不到则返回最近上方位置。"""
+        pos = self.line_to_position.get(line)
+        if pos:
+            return pos
+        # 此行可能是段落间空行:找其上最近的已知行
+        for candidate in range(line - 1, -1, -1):
+            if candidate in self.line_to_position:
+                return self.line_to_position[candidate]
+        return None
 
     def _handle_page_scroll_immediate(self, direction):
         self.auto_scroll_enabled = False
@@ -1130,11 +1162,9 @@ class Lue:
         # 越过窗口边界:窗口滑动一章并保持视口连续
         at_edge = direction > 0 and self.scroll_offset >= max_scroll and getattr(self, '_window_end', 0) < len(self.chapters)
         if at_edge:
-            delta = self._slide_window(1)
-            new_offset = max(0, self.scroll_offset - delta)
+            new_offset = self._slide_window(1)
         elif direction < 0 and self.scroll_offset <= 0 and getattr(self, '_window_base', 0) > 0:
-            self._slide_window(-1)
-            new_offset = max(0, len(self.document_lines) - page_size)
+            new_offset = self._slide_window(-1)
         self.scroll_offset = self.target_scroll_offset = new_offset
         if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
         self._save_extended_progress()
@@ -1146,11 +1176,9 @@ class Lue:
         target_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max_scroll, self.scroll_offset + page_size)
         at_edge = direction > 0 and self.scroll_offset >= max_scroll and getattr(self, '_window_end', 0) < len(self.chapters)
         if at_edge:
-            delta = self._slide_window(1)
-            target_offset = max(0, self.scroll_offset - delta)
+            target_offset = self._slide_window(1)
         elif direction < 0 and self.scroll_offset <= 0 and getattr(self, '_window_base', 0) > 0:
-            self._slide_window(-1)
-            target_offset = max(0, len(self.document_lines) - page_size)
+            target_offset = self._slide_window(-1)
         if config.SMOOTH_SCROLLING_ENABLED:
             self._smooth_scroll_to(target_offset)
         else:

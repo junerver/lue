@@ -9,8 +9,10 @@
 
 use fancy_regex::Regex;
 use pyo3::prelude::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fs;
 use std::sync::OnceLock;
+use std::time::UNIX_EPOCH;
 
 // ---------------------------------------------------------------------------
 // Character classes (kept aligned with Python's `\s` / `str.strip()` sets)
@@ -1080,6 +1082,211 @@ fn decode_gb18030_or_latin1(bytes: &[u8]) -> (String, String) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceFingerprint {
+    size: u64,
+    mtime_ns: u128,
+}
+
+fn source_fingerprint(path: &str) -> PyResult<SourceFingerprint> {
+    let metadata = fs::metadata(path).map_err(|e| {
+        pyo3::exceptions::PyOSError::new_err(format!("cannot stat {path}: {e}"))
+    })?;
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(SourceFingerprint {
+        size: metadata.len(),
+        mtime_ns,
+    })
+}
+
+#[pyclass]
+struct IndexedTxtBook {
+    path: String,
+    encoding: String,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
+    intro_first: bool,
+    fingerprint: SourceFingerprint,
+    chapter_cache: VecDeque<(usize, Vec<String>)>,
+    cache_capacity: usize,
+}
+
+impl IndexedTxtBook {
+    fn ensure_current(&self) -> PyResult<()> {
+        let current = source_fingerprint(&self.path)?;
+        if current != self.fingerprint {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "indexed TXT source changed; rebuild the index",
+            ));
+        }
+        Ok(())
+    }
+
+    fn decode_chapter_uncached(&self, index: usize) -> PyResult<Vec<String>> {
+        self.ensure_current()?;
+        let start = self.starts[index] as usize;
+        let end = self.ends[index] as usize;
+        let bytes = fs::read(&self.path).map_err(|e| {
+            pyo3::exceptions::PyOSError::new_err(format!("cannot read {}: {e}", self.path))
+        })?;
+        if start > end || end > bytes.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "indexed TXT chapter span is outside the source file",
+            ));
+        }
+        let raw = &bytes[start..end];
+        let text = match self.encoding.as_str() {
+            "utf-8" | "utf-8-sig" => std::str::from_utf8(raw)
+                .map_err(|e| pyo3::exceptions::PyUnicodeDecodeError::new_err(e.to_string()))?
+                .to_string(),
+            "gb18030" => encoding_rs::GB18030.decode(raw).0.into_owned(),
+            "latin-1" => raw.iter().map(|&b| b as char).collect(),
+            _ => return Err(pyo3::exceptions::PyValueError::new_err("unsupported TXT encoding")),
+        };
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut result = Vec::new();
+        let preface = self.intro_first && index == 0;
+        for (line_index, line) in normalized.split('\n').enumerate() {
+            let cleaned = clean_visual_text_impl(py_trim(line));
+            if cleaned.is_empty() {
+                continue;
+            }
+            if preface || line_index == 0 || cleaned.chars().count() > 3 {
+                result.push(cleaned);
+            }
+        }
+        Ok(result)
+    }
+
+    fn read_chapter_impl(&mut self, index: usize) -> PyResult<Vec<String>> {
+        if index >= self.starts.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(index));
+        }
+        if let Some(pos) = self.chapter_cache.iter().position(|(i, _)| *i == index) {
+            let entry = self.chapter_cache.remove(pos).unwrap();
+            let result = entry.1.clone();
+            self.chapter_cache.push_back(entry);
+            return Ok(result);
+        }
+        let result = self.decode_chapter_uncached(index)?;
+        self.chapter_cache.push_back((index, result.clone()));
+        while self.chapter_cache.len() > self.cache_capacity {
+            self.chapter_cache.pop_front();
+        }
+        Ok(result)
+    }
+}
+
+#[pymethods]
+impl IndexedTxtBook {
+    #[staticmethod]
+    fn from_index(
+        path: String,
+        encoding: String,
+        starts: Vec<u64>,
+        ends: Vec<u64>,
+        intro_first: bool,
+    ) -> PyResult<Self> {
+        if starts.is_empty() || starts.len() != ends.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "invalid TXT chapter index",
+            ));
+        }
+        if starts.windows(2).any(|w| w[0] >= w[1]) || starts.iter().zip(&ends).any(|(s, e)| s >= e) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "TXT chapter spans must be ordered and non-empty",
+            ));
+        }
+        let fingerprint = source_fingerprint(&path)?;
+        if ends.iter().any(|e| *e > fingerprint.size) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "TXT chapter index exceeds source file",
+            ));
+        }
+        Ok(Self {
+            path,
+            encoding,
+            starts,
+            ends,
+            intro_first,
+            fingerprint,
+            chapter_cache: VecDeque::new(),
+            cache_capacity: 64,
+        })
+    }
+
+    fn chapter_count(&self) -> usize {
+        self.starts.len()
+    }
+
+    fn source_fingerprint(&self) -> (u64, u128) {
+        (self.fingerprint.size, self.fingerprint.mtime_ns)
+    }
+
+    fn read_chapter(&mut self, index: isize) -> PyResult<Vec<String>> {
+        let normalized = if index < 0 {
+            self.starts.len() as isize + index
+        } else {
+            index
+        };
+        if normalized < 0 {
+            return Err(pyo3::exceptions::PyIndexError::new_err(index));
+        }
+        self.read_chapter_impl(normalized as usize)
+    }
+
+    fn layout_window(
+        &mut self,
+        center: usize,
+        before: usize,
+        after: usize,
+        width: usize,
+    ) -> PyResult<(
+        Vec<String>,
+        Vec<(i64, i64, i64)>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<(i64, i64, i64)>,
+        Vec<(i64, i64)>,
+        Vec<(i64, i64)>,
+        Vec<(i64, i64, i64)>,
+        Vec<i64>,
+        usize,
+    )> {
+        if center >= self.starts.len() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(center));
+        }
+        let base = center.saturating_sub(before);
+        let end = (center + after + 1).min(self.starts.len());
+        let mut chapters = Vec::with_capacity(end - base);
+        for index in base..end {
+            chapters.push(self.read_chapter_impl(index)?);
+        }
+        let mut result = layout_document(chapters, width);
+        let shift = base as i64;
+        if shift != 0 {
+            for key in &mut result.1 {
+                key.0 += shift;
+            }
+            for value in &mut result.4 {
+                value.0 += shift;
+            }
+            for key in &mut result.5 {
+                key.0 += shift;
+            }
+            for key in &mut result.7 {
+                key.0 += shift;
+            }
+        }
+        Ok(result)
+    }
+}
+
 /// Whole-document layout in one Rust call: wraps every paragraph, builds
 /// the sentence->line index, line->paragraph index, paragraph ranges and
 /// the line-sorted position index. Returns flat parallel vectors that
@@ -1178,6 +1385,7 @@ fn layout_document(
 
 #[pymodule]
 fn lue_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<IndexedTxtBook>()?;
     m.add_function(wrap_pyfunction!(split_sentences, m)?)?;
     m.add_function(wrap_pyfunction!(split_sentences_batch, m)?)?;
     m.add_function(wrap_pyfunction!(clean_visual_text, m)?)?;

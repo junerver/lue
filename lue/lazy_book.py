@@ -38,6 +38,17 @@ class LazyChapters:
             if _rust.lue_rs is not None
             else clean_visual_text
         )
+        # Optional Rust book handle: when available, chapter decode + LRU live
+        # in Rust (shared ownership, fewer Python allocations). Falls back to
+        # the Python path if your Rust wheel predates IndexedTxtBook.
+        self._rust_book = None
+        if _rust.lue_rs is not None and hasattr(_rust.lue_rs, "IndexedTxtBook"):
+            try:
+                self._rust_book = _rust.lue_rs.IndexedTxtBook.from_index(
+                    path, encoding, self._starts, self._ends, intro_first
+                )
+            except Exception:
+                self._rust_book = None
 
     # -- sequence protocol ---------------------------------------------------
 
@@ -51,6 +62,12 @@ class LazyChapters:
             i += len(self)
         if not 0 <= i < len(self._starts):
             raise IndexError(i)
+        if self._rust_book is not None:
+            try:
+                return self._rust_book.read_chapter(i)
+            except Exception:
+                # Index may be stale; fall back to Python decode.
+                pass
         cached = self._cache.get(i)
         if cached is None:
             cached = self._decode_chapter(i)

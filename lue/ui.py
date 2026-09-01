@@ -175,14 +175,39 @@ def build_window_layout(reader, center_chapter):
 
     Structures keep their global chapter numbers in keys (ranges/positions),
     while line numbers are window-relative starting at 0 — the reader's
-    scroll state is also window-relative. Falls back to the pure-Python
-    per-paragraph path when the Rust extension is unavailable.
+    scroll state is also window-relative. When the book uses LazyChapters,
+    the Rust IndexedTxtBook handle lays out the window itself. Falls back to
+    the pure-Python per-paragraph path when the extension is unavailable.
     """
     base, end = window_range(reader, center_chapter)
-    window_chapters = reader.chapters[base:end]
     available_width = _available_text_width()
 
-    if _rust.lue_rs is not None:
+    rust_book = getattr(reader, '_lazy_book', None)
+    if rust_book is not None and getattr(rust_book, '_rust_book', None) is not None:
+        try:
+            (
+                document_lines,
+                pos_keys,
+                pos_vals,
+                l2p_keys,
+                l2p_vals,
+                range_keys,
+                range_vals,
+                sorted_positions,
+                sorted_lines,
+                _total,
+            ) = rust_book._rust_book.layout_window(
+                center_chapter, WINDOW_CHAPTERS_BEFORE, WINDOW_CHAPTERS_AFTER, available_width
+            )
+            reader.document_lines = document_lines
+            reader.position_to_line = dict(zip(pos_keys, pos_vals))
+            reader.line_to_position = dict(zip(l2p_keys, l2p_vals))
+            reader.paragraph_line_ranges = dict(zip(range_keys, range_vals))
+            reader._sorted_line_positions = (sorted_positions, sorted_lines)
+        except _rust._PANIC_TYPES:
+            _build_window_layout_py(reader, base, end, available_width)
+    elif _rust.lue_rs is not None:
+        window_chapters = reader.chapters[base:end]
         try:
             (
                 document_lines,

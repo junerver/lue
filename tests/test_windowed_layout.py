@@ -46,6 +46,8 @@ class StubReader:
     # reader helpers used by the window code live on Lue; borrow them
     _ensure_window = Lue._ensure_window
     _chapter_progress_fraction = Lue._chapter_progress_fraction
+    _slide_window = Lue._slide_window
+    _position_at_line = Lue._position_at_line
 
 
 def build_chapters(n):
@@ -172,3 +174,96 @@ def test_initialize_progress_recomputes_scroll_in_window(tmp_path, monkeypatch):
     assert 0 <= r.scroll_offset < len(r.document_lines)
     # The manual anchor maps to a real line and is visible-ish (not empty view).
     assert (10, 0, 0) in r.position_to_line
+
+
+@pytest.fixture
+def sliding_reader(tmp_path, monkeypatch):
+    """A reader-like stub with a real book and initial window; lets us call
+    the slide logic without raw TTY/audio plumbing."""
+    import json
+
+    from lue import progress_manager
+
+    chapters = build_chapters(40)
+    book_path = tmp_path / "slide_book.txt"
+    book_path.write_text(
+        "\n".join(f"第{i}章标题\n正文{i}内容足够长以参与排版。" for i in range(40)),
+        encoding="utf-8",
+    )
+
+    class SlideStub(StubReader):
+        def __init__(self):
+            super().__init__(chapters)
+            self.file_path = str(book_path)
+            self.book_title = "slide"
+            self.progress_file = str(tmp_path / "slide.progress.json")
+            self.tts_model = None
+            self._initial_load_complete = True
+            self.scroll_offset = 0.0
+            self.target_scroll_offset = 0.0
+            self.smooth_scroll_task = None
+            self.auto_scroll_enabled = False
+
+    r = SlideStub()
+    ui.build_window_layout(r, 0)
+    return r
+
+
+def test_slide_window_forward_keeps_viewport_anchor(sliding_reader):
+    r = sliding_reader
+    base_before = r._window_base
+    # Put the viewport near the bottom of the first window, then slide.
+    max_scroll = max(0, len(r.document_lines) - 20)
+    r.scroll_offset = r.target_scroll_offset = float(max_scroll)
+    new_offset = r._slide_window(1)
+    assert new_offset >= 0
+    # Window must have advanced.
+    assert r._window_base > base_before
+    # The anchor sentence (top of old viewport) must exist in the new window.
+    anchor = r._position_at_line(int(r.scroll_offset))
+    assert anchor is not None
+    assert anchor in r.position_to_line
+
+
+def test_slide_window_backward_keeps_viewport_anchor(sliding_reader):
+    r = sliding_reader
+    ui.build_window_layout(r, 10)
+    base_before = r._window_base
+    r.scroll_offset = r.target_scroll_offset = 5.0
+    new_offset = r._slide_window(-1)
+    assert new_offset >= 0
+    assert r._window_base < base_before
+
+
+def test_manual_anchor_restore_centers_anchor_chapter(tmp_path, monkeypatch):
+    """A manual scroll anchor in a later chapter must center the restore
+    window on that chapter, not on the saved playback chapter."""
+    import json
+
+    from lue import progress_manager
+
+    chapters = build_chapters(30)
+    progress_file = tmp_path / "anchor.progress.json"
+    progress_file.write_text(json.dumps({
+        "c": 2, "p": 0, "s": 0,
+        "scroll_offset": 999999,
+        "tts_enabled": False,
+        "auto_scroll_enabled": False,
+        "speed_reading_enabled": False,
+        "manual_scroll_anchor": [20, 0, 0],
+        "playback_speed": 1.0,
+    }), encoding="utf-8")
+
+    class AnchorStub(StubReader):
+        def __init__(self):
+            super().__init__(chapters)
+            self.progress_file = str(progress_file)
+            self.tts_model = None
+
+    r = AnchorStub()
+    ui.build_window_layout(r, 0)
+    Lue._initialize_progress(r)
+    # Window must cover chapter 20 (the anchor), not chapter 2 (playback).
+    assert r._window_base <= 20 < r._window_end
+    # Manual anchor must map into the window and be visible-ish.
+    assert (20, 0, 0) in r.position_to_line
