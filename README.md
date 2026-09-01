@@ -1,54 +1,77 @@
 <div align="center">
 
-<img src="images/lue-icon.png" alt="Lue Icon" width="35%" />
+<img src="images/lue-icon.png" alt="Lue-rs Icon" width="35%" />
 
-### Lue - Terminal eBook Reader with Text-to-Speech
+### Lue-rs - Fast Terminal eBook Reader with Text-to-Speech
 
 <img src="images/lue-screenshot.gif" alt="Lue Screenshot" width="100%" />
 
-Lue is a versatile terminal eBook and document reader that is designed to seamlessly blend reading and listening. Built with multi-format support and modular multi-lingual text-to-speech integration, it provides synchronized word highlighting, smooth auto-scrolling, chapter navigation and persistent progress tracking to keep your reading workflow simple and streamlined.
+Lue-rs is a performance fork of [Lue](https://github.com/paulilaaso/lue), a versatile terminal eBook and document reader that blends reading and listening. It keeps the full Lue feature set — multi-format support, modular multilingual text-to-speech with synchronized word highlighting, auto-scrolling, chapter navigation and persistent progress tracking — while reworking the engine for instant startup.
 
 </div>
 
 ---
 
+## What's Different from Upstream Lue
+
+| **Area**                  | **Upstream Lue**                                | **Lue-rs**                                                                        |
+| ------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------- |
+| **Parsing & layout**      | Pure Python                                     | Hot paths rewritten in Rust (PyO3): sentence splitting, text cleaning, TXT chapter-rule scanning, line layout |
+| **Document model**        | Reads and parses the whole file up front        | Windowed rendering: the reader never loads the full book — a byte-level TXT index enables random access, and only the current chapter (± a small window) is decoded and laid out |
+| **Startup**               | Grows with book size (an 11 MB novel took ~4 s) | Near-instant: ~0.6 s cold open (building the index once), 11–45 ms warm opens, ~7 ms chapter jumps on the same 11 MB / 1097-chapter novel (WSL) |
+| **Startup pipeline**      | TTS + audio stack initialized eagerly          | Simplified launch: TTS disabled by default, heavy imports deferred, parsed/index/layout results cached on disk |
+| **Management commands**   | —                                               | `lue list` (reading history) and `lue clear` (records + caches)                   |
+
+The Rust accelerator is **optional**: without the `lue_rs` wheel everything falls back to the retained pure-Python implementations, and `LUE_NO_RUST=1` disables it at runtime for A/B testing. See [docs/RUST_REWRITE.md](docs/RUST_REWRITE.md) for the architecture notes.
+
+---
+
 ## Features
 
-| **Feature**                             | **Description**                                                                                |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Feature**                          | **Description**                                                                                |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------- |
 | **Multi-Format Support**             | Support for EPUB, PDF, TXT, DOCX, HTML, RTF, and Markdown with seamless format detection  |
-| **Modular TTS System**               | Edge TTS (default) and Kokoro TTS (local/offline) with extensible architecture for new models  |
+| **Rust-Accelerated Engine**          | Parsing, chapter indexing, and layout run in Rust (PyO3) with graceful pure-Python fallbacks |
+| **Windowed Rendering**               | Only the visible chapter window is decoded and laid out, so open time is independent of book size |
+| **Modular TTS System**               | Edge TTS and Kokoro TTS (local/offline) with extensible architecture for new models; disabled by default for the fastest startup |
 | **Cross-Platform & Multilingual**    | Full support for macOS, Linux, Windows (via WSL) with 100+ languages and consistent global experience    |
 | **Speed Adjustment**                 | Adjust text-to-speech playback speed from 1x to 3x for personalized listening experience       |
-| **Auto-Scroll & Precise Word Highlighting**        | Automatic scrolling and word-level highlighting synchronized with actual speech, improving focus and concentration     |
+| **Auto-Scroll & Precise Word Highlighting** | Automatic scrolling and word-level highlighting synchronized with actual speech, improving focus and concentration     |
 | **Smart Persistence**                | Automatic progress saving, state restoration, and cross-session continuity for seamless reading|
 | **Fast Navigation**                  | Intuitive shortcuts, mouse support, smooth scrolling and chapters list for fast navigation.     |
+| **Reading History Management**       | `lue list` shows every book in your history; `lue clear` wipes records and caches in one step |
 | **Extensive Customization**          | Fully customizable keyboard layouts (including Vim-style bindings), adjustable UI elements, colors, and display modes|
 
 ---
 
 ## Quick Start (macOS and Linux)
 
-> **Want to try Lue right away?** Follow these simple steps:
+> **Want to try Lue-rs right away?** Follow these simple steps:
 
 ```bash
-# 1. Install FFmpeg (required for audio processing)
-# macOS
-brew install ffmpeg
-# Ubuntu/Debian  
-sudo apt install ffmpeg
+# 1. Install Rust (used only for the optional accelerator)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 2. Install the latest version from PyPI
-pip install lue-reader 
+# 2. Clone this fork
+git clone https://github.com/junerver/lue-rs.git
+cd lue-rs
 
-# 3. Practice using Lue with the navigation guide
+# 3. Install the Python package (standalone, pure-Python fallback included)
+pip install .
+
+# 4. Optional but recommended: build and install the Rust accelerator
+pip install maturin
+(cd rust && maturin build --release)
+pip install rust/target/wheels/lue_rs-*.whl
+
+# 5. Practice using Lue-rs with the navigation guide
 lue --guide
 
-# 4. Start reading!
-lue path/to/your/book.epub 
+# 6. Start reading!
+lue path/to/your/book.txt
 ```
 
-> **Note:** Quick start uses Edge TTS (requires internet). For offline capabilities, see [full installation](#-installation-macos-linux-and-windows).
+> **Note:** TTS is disabled by default, so no audio stack is needed to start reading. FFmpeg is only required when you launch with `--tts edge` / `--tts kokoro`.
 
 ---
 
@@ -57,9 +80,11 @@ lue path/to/your/book.epub
 ### Prerequisites
 
 #### Core Requirements
-- **FFmpeg** - Audio processing (required)
+- **Python 3.10+** (required)
 
-#### Optional Dependencies  
+#### Optional Dependencies
+- **Rust toolchain + maturin** - to build the `lue_rs` accelerator wheel (highly recommended)
+- **FFmpeg** - audio processing, only needed for TTS
 - **espeak** - Kokoro TTS support
 
 #### macOS (Homebrew)
@@ -72,17 +97,8 @@ brew install espeak
 #### Ubuntu/Debian
 ```bash
 sudo apt update && sudo apt install ffmpeg
-# Optional  
+# Optional
 sudo apt install espeak
-```
-
-#### Arch Linux (AUR)
-```bash
-# Using yay
-yay -S lue-reader-git
-
-# Or using paru
-paru -S lue-reader-git
 ```
 
 #### Windows
@@ -96,24 +112,37 @@ wsl --install
 # 3. Inside Ubuntu terminal:
 sudo apt update && sudo apt upgrade -y
 sudo apt install ffmpeg python3 python3-pip -y
-# Optional  
+# Optional
 sudo apt install espeak
 ```
 
-### Install Lue
+### Install Lue-rs
 
 #### Standard Installation
 
 ```bash
-# 1. Clone repository
-git clone https://github.com/paulilaaso/lue.git
-cd lue
+# 1. Clone this fork
+git clone https://github.com/junerver/lue-rs.git
+cd lue-rs
 
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Install Lue
+# 2. Install the Python package
 pip install .
+
+# 3. Install the Rust accelerator (optional, recommended)
+rustup component add cargo  # if you skipped rustup earlier: https://rustup.rs
+pip install maturin
+(cd rust && maturin build --release)
+pip install rust/target/wheels/lue_rs-*.whl
+```
+
+#### Using pipx
+
+```bash
+# 1. Install the Python package into its own venv
+pipx install .
+
+# 2. Inject the Rust accelerator wheel built in the previous step
+pipx inject lue-reader rust/target/wheels/lue_rs-*.whl
 ```
 
 #### Enable Kokoro TTS (Optional)
@@ -121,22 +150,13 @@ pip install .
 For local/offline TTS capabilities:
 
 ```bash
-# 1. Edit requirements.txt - uncomment Kokoro packages:
-kokoro>=0.9.4
-soundfile>=0.13.1
-huggingface-hub>=0.34.4
+pip install ".[kokoro]"
 
-# 2. Install PyTorch
+# Install PyTorch
 # CPU version:
 pip install torch torchvision torchaudio
 # GPU version (CUDA):
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# 3. Install updated requirements
-pip install -r requirements.txt
-
-# 4. Install Lue
-pip install .
 ```
 
 ---
@@ -159,14 +179,14 @@ lue list
 # settings, logs, and audio cache)
 lue clear
 
-# Practice Lue default keys with the navigation guide
+# Practice Lue-rs default keys with the navigation guide
 lue --guide
 
 # View available command line options
 lue --help
 
-# Use specific TTS model (edge/kokoro/none) 
-lue --tts kokoro path/to/your/book.epub
+# Use a TTS model (edge/kokoro/none; default: none)
+lue --tts edge path/to/your/book.epub
 
 # Use a specific voice (full list at VOICES.md)
 lue --voice "en-US-AriaNeural" path/to/your/book.epub
@@ -225,25 +245,25 @@ lue -m 3 path/to/your/book.epub
 ### Mouse Controls
 
 - **Click** - Jump to sentence
-- **Scroll** - Navigate content  
+- **Scroll** - Navigate content
 - **Progress bar click** - Jump to position
 
 ## Customize
 
 ### UI Modes
 
-Lue offers four UI complexity modes that you can cycle through using the `v` key, set as your default in the [config.py](lue/config.py) file, or choose at launch with `-m` / `--mode`:
+Lue-rs offers four UI complexity modes that you can cycle through using the `v` key, set as your default in the [config.py](lue/config.py) file, or choose at launch with `-m` / `--mode`:
 
 - **Mode 0 (Minimal)** - Clean text-only display with no borders or UI elements
 - **Mode 1 (Medium)** - Displays a top title bar with progress information and borders
 - **Mode 2 (Full)** - Full UI with both top title bar and bottom control information
 - **Mode 3 (Speed Reading)** - Single-word speed-reading display
 
-Additionally, Lue provides customizable word-level and sentence-level highlighting that can be adjusted to suit your reading preferences. You can cycle through different highlighting modes using the `w` and `s` keys. These highlighting settings can also be configured as defaults in the [config.py](lue/config.py) file.
+Additionally, Lue-rs provides customizable word-level and sentence-level highlighting that can be adjusted to suit your reading preferences. You can cycle through different highlighting modes using the `w` and `s` keys. These highlighting settings can also be configured as defaults in the [config.py](lue/config.py) file.
 
 ### Keyboard Layouts
 
-Lue comes with two built-in keyboard layouts that can be set using -k/--key command line option or set as your default in the [config.py](lue/config.py) file. You can create your own keyboard layout by copying and modifying one of the existing layout files:
+Lue-rs comes with two built-in keyboard layouts that can be set using -k/--key command line option or set as your default in the [config.py](lue/config.py) file. You can create your own keyboard layout by copying and modifying one of the existing layout files:
 
 - **Default Layout** - [keys_default.json](lue/keys_default.json) - Standard keyboard layout
 - **Vim Layout** - [keys_vim.json](lue/keys_vim.json) - Vim-style keyboard layout
@@ -251,7 +271,7 @@ Lue comes with two built-in keyboard layouts that can be set using -k/--key comm
 
 ### Color Themes
 
-Lue allows you to customize the color theme, visual icons/symbols and all ui elements of the interface by modifying the classes in [ui.py](lue/ui.py). Create your own theme or choose one of the three themes that come with the default installation.
+Lue-rs allows you to customize the color theme, visual icons/symbols and all ui elements of the interface by modifying the classes in [ui.py](lue/ui.py). Create your own theme or choose one of the three themes that come with the default installation.
 
 - **Default Theme** - The default colorful theme with various colors for different UI elements
 - **Black Theme** - A dark monochrome theme that's suitable for bright backgrounds
@@ -261,21 +281,27 @@ Lue allows you to customize the color theme, visual icons/symbols and all ui ele
 
 ## Development
 
-> **Interested in extending Lue?** 
+> **Interested in extending Lue-rs?**
 
-Check out the [Developer Guide](DEVELOPER.md) for instructions on adding new TTS models and contributing to the project.
+The Rust accelerator lives in [rust/](rust/) (a PyO3 crate built with maturin); its architecture and roadmap are documented in [docs/RUST_REWRITE.md](docs/RUST_REWRITE.md). Check out the [Developer Guide](DEVELOPER.md) for instructions on adding new TTS models and contributing to the project.
 
 ### Data Storage
 
 **Reading Progress:**
 - **macOS:** `~/Library/Application Support/lue/`
-- **Linux:** `~/.local/share/lue/`  
+- **Linux:** `~/.local/share/lue/`
 - **Windows (WSL):** `~/.local/share/lue/` (within WSL filesystem)
 
 **Error Logs:**
 - **macOS:** `~/Library/Logs/lue/error.log`
 - **Linux:** `~/.cache/lue/log/error.log`
 - **Windows (WSL):** `~/.cache/lue/log/error.log` (within WSL filesystem)
+
+---
+
+## Credits
+
+Lue-rs is a fork of [Lue](https://github.com/paulilaaso/lue) by [@paulilaaso](https://github.com/paulilaaso) and its contributors. All credit for the original design and feature set belongs to them; this fork focuses on the Rust-accelerated performance work.
 
 ---
 

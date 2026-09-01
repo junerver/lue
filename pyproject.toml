@@ -45,9 +45,10 @@ kokoro = [
 lue = "lue.__main__:cli"
 
 [project.urls]
-Homepage = "https://github.com/paulilaaso/lue"
-Repository = "https://github.com/paulilaaso/lue"
-Issues = "https://github.com/paulilaaso/lue/issues"
+Homepage = "https://github.com/junerver/lue-rs"
+Repository = "https://github.com/junerver/lue-rs"
+Issues = "https://github.com/junerver/lue-rs/issues"
+Upstream = "https://github.com/paulilaaso/lue"
 
 [tool.setuptools.packages.find]
 include = ["lue*"]
