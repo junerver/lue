@@ -135,51 +135,78 @@ def save_extended_progress(progress_file, chapter_idx, paragraph_idx, sentence_i
         json.dump(progress, f, indent=2)
     os.replace(tmp_file, progress_file)
 
-def get_recent_books(limit=5):
-    """
-    Get a list of recently read books.
-    
-    Args:
-        limit: Maximum number of books to return
-        
-    Returns:
-        list: List of dicts containing title, path, and percentage
+def list_read_books():
+    """Return every readable saved-book record, newest first.
+
+    Unlike ``get_recent_books`` this intentionally has no five-book UI
+    limit. Each record includes the progress-file timestamp so the CLI can
+    present a stable history.
     """
     progress_files = glob.glob(os.path.join(config.PROGRESS_FILE_DIR, "*.progress.json"))
-    
-    # Sort by modification time (newest first)
     progress_files.sort(key=os.path.getmtime, reverse=True)
-    
-    recent_books = []
+
+    records = []
     for pf in progress_files:
-        if len(recent_books) >= limit:
-            break
-            
         try:
             with open(pf, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                
             original_path = data.get("original_file_path")
             if not original_path or not os.path.exists(original_path):
                 continue
-                
-            # Derive title from filename if not stored (we don't store title currently, so use filename)
-            title = os.path.basename(original_path)
-            # Remove extension
-            title = os.path.splitext(title)[0]
-            
-            percentage = data.get("completion_percentage", 0.0)
-            
-            recent_books.append({
-                "title": title,
+            records.append({
+                "title": os.path.splitext(os.path.basename(original_path))[0],
                 "path": original_path,
-                "percentage": percentage
+                "percentage": float(data.get("completion_percentage", 0.0)),
+                "modified_time": os.path.getmtime(pf),
             })
-            
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
             continue
-            
-    return recent_books
+    return records
+
+
+def get_recent_books(limit=5):
+    """Get a limited recent-book list for the interactive ``r`` menu."""
+    return [
+        {key: value for key, value in record.items() if key != "modified_time"}
+        for record in list_read_books()[:limit]
+    ]
+
+
+def clear_reading_data():
+    """Delete reading records and derived book caches.
+
+    Original book files, user settings, logs and audio cache are never
+    touched. The operation is idempotent and reports deletion counts plus
+    per-path errors for noninteractive CLI callers.
+    """
+    result = {"progress": 0, "parsed": 0, "txt_index": 0, "errors": []}
+
+    for pf in glob.glob(os.path.join(config.PROGRESS_FILE_DIR, "*.progress.json")):
+        try:
+            os.remove(pf)
+            result["progress"] += 1
+        except OSError as exc:
+            result["errors"].append((pf, str(exc)))
+
+    for dirname, key in (("parsed", "parsed"), ("txt-index", "txt_index")):
+        directory = os.path.join(config.PROGRESS_FILE_DIR, dirname)
+        try:
+            entries = list(os.scandir(directory))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            result["errors"].append((directory, str(exc)))
+            continue
+        for entry in entries:
+            try:
+                if entry.is_file() or entry.is_symlink():
+                    os.remove(entry.path)
+                    result[key] += 1
+                elif entry.is_dir():
+                    result["errors"].append((entry.path, "unexpected directory skipped"))
+            except OSError as exc:
+                result["errors"].append((entry.path, str(exc)))
+    return result
 
 def validate_and_set_progress(chapters, progress_file, c, p, s):
     """

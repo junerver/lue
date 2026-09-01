@@ -146,11 +146,18 @@ pip install .
 ### Basic Commands
 
 ```bash
-# Start with default TTS
+# Open a book (TTS is disabled by default for the fastest startup)
 lue path/to/your/book.epub
 
 # Launch without arguments to open the last book you were reading
 lue
+
+# List every readable book in local reading history
+lue list
+
+# Clear reading records plus parsed/TXT-index caches (keeps book files,
+# settings, logs, and audio cache)
+lue clear
 
 # Practice Lue default keys with the navigation guide
 lue --guide

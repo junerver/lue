@@ -18,6 +18,7 @@ except ImportError:
 from rich.console import Console
 from .reader import Lue
 from . import config, progress_manager, input_handler
+from .management import run_management_command
 from .tts_manager import TTSManager
 
 def get_keyboard_shortcuts_file(keys_arg):
@@ -134,6 +135,11 @@ def preprocess_filter_args(args):
 async def main():
     # Preprocess arguments to handle filter syntax
     preprocessed_args = preprocess_filter_args(sys.argv[1:])
+
+    # Management commands intentionally exit before TTS discovery, ffmpeg
+    # checks, keyboard setup, raw terminal mode, or Lue construction.
+    if run_management_command(preprocessed_args):
+        return
 
     # TTS 探测会 import edge_tts 等 (~200ms)。默认 -t none 下完全跳过,
     # 仅当用户显式传了 -t(非 none)或无参数时才需要探测可用模型。
