@@ -160,3 +160,6 @@ data/
 
 # Logs
 *.log
+
+# Tool-generated workspace metadata
+.zcode/
