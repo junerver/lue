@@ -5,7 +5,6 @@ import time
 
 import pytest
 from rich.console import Console
-from rich.text import Text
 
 from lue import cache as cache_mod
 from lue import content_parser as cp
@@ -83,29 +82,4 @@ def test_parsed_cache_corrupt_returns_none(book_path, tmp_path):
     os.makedirs(os.path.dirname(c._file), exist_ok=True)
     with open(c._file, "wb") as f:
         f.write(b"not a pickle")
-    assert c.load() is None
-
-
-def test_layout_cache_roundtrip(book_path):
-    chapters = cp._extract_content_txt(book_path, make_console())
-    layout = build_layout(chapters, 100)
-    stat = os.stat(book_path)
-    key = cache_mod.LayoutCache.key_for(stat, 100)
-    cache_mod.LayoutCache(book_path, key).store(layout)
-    loaded = cache_mod.LayoutCache(book_path, key).load()
-    assert loaded is not None
-    # lines are stored as plain strings now (Text reconstructs on load)
-    assert loaded["lines"] == ["x"]
-    assert loaded["position_to_line"] == layout["position_to_line"]
-    # Different width -> different key -> miss.
-    assert cache_mod.LayoutCache(book_path, cache_mod.LayoutCache.key_for(stat, 80)).load() is None
-
-
-def test_layout_cache_corrupt_returns_none(book_path, tmp_path):
-    stat = os.stat(book_path)
-    key = cache_mod.LayoutCache.key_for(stat, 100)
-    c = cache_mod.LayoutCache(book_path, key)
-    os.makedirs(os.path.dirname(c._file), exist_ok=True)
-    with open(c._file, "wb") as f:
-        f.write(b"junk")
     assert c.load() is None

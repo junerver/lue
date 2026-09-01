@@ -4,15 +4,10 @@ Opening a large book currently pays parse (~1.1s), sentence counting
 (~0.2s) and full layout rebuild (~1.6s) synchronously before the UI shows
 anything. Re-opening the same book — the common case — re-pays all of it.
 
-Two caches, both content-addressed so a changed file never serves stale
-data:
-
-- ``ParsedBookCache``: the parsed chapters + total_sentences for a file,
-  keyed by (mtime, size). Every reader session needs exactly this.
-- ``LayoutCache``: the full layout for a file at a given terminal width,
-  keyed by (mtime, size, width). Rebuilds on width change (v key / resize)
-  are ~1.6s of blocking work; the in-memory layout cache only covers width
-  changes within a session, not re-opens.
+ParsedBookCache: the parsed chapters for a file, keyed by (mtime, size).
+Every reader session needs exactly this; layout is windowed (legado-style,
+current chapter +/- neighbors) and rebuilds in ~10ms, so it is not cached
+on disk.
 
 Pickle is safe here: the payloads are plain lists of str (chapters) and
 plain dicts of Text instances (layout). Values are validated on load and a
@@ -94,56 +89,3 @@ class ParsedBookCache(_BaseCache):
 
     def store(self, chapters) -> None:
         self._store({"chapters": chapters})
-
-
-class LayoutCache(_BaseCache):
-    """Caches a built layout for one book at one width.
-
-    Stores plain strings for the document lines (Text objects reconstruct
-    from plain text at load — this keeps the cache file ~30x smaller and
-    deserialization ~70x faster than pickling Text instances). Keyed by
-    (mtime, size, width) so a terminal resize or book edit rebuilds.
-    """
-
-    _dir = "layout"
-
-    @classmethod
-    def key_for(cls, stat, width: int) -> str:
-        return f"m{int(stat.st_mtime_ns)}-s{stat.st_size}-w{width}"
-
-    def load(self):
-        data = self._load()
-        if not isinstance(data, dict):
-            return None
-        try:
-            lines = data["lines"]  # list of str
-            line_to_position = data["line_to_position"]
-            position_to_line = data["position_to_line"]
-            paragraph_ranges = data["paragraph_ranges"]
-            sorted_index = data["sorted_index"]
-        except KeyError:
-            return None
-        if not isinstance(lines, list) or not all(isinstance(l, str) for l in lines):
-            return None
-        if not isinstance(line_to_position, dict) or not isinstance(position_to_line, dict):
-            return None
-        if not isinstance(paragraph_ranges, dict) or not isinstance(sorted_index, (list, tuple)):
-            return None
-        return {
-            "lines": lines,
-            "line_to_position": line_to_position,
-            "position_to_line": position_to_line,
-            "paragraph_ranges": paragraph_ranges,
-            "sorted_index": sorted_index,
-            "total_sentences": data.get("total_sentences", 0) or 0,
-        }
-
-    def store(self, layout: dict) -> None:
-        payload = dict(layout)
-        # lines are plain strings in the rebuilt layout (Text objects only on
-        # the in-memory cache path); normalize to str either way.
-        payload["lines"] = [
-            line.plain if hasattr(line, "plain") else line for line in layout["lines"]
-        ]
-        self._store(payload)
-

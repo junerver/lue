@@ -259,8 +259,11 @@ class Lue:
         self.ui_paragraph_idx = self.paragraph_idx
         self.ui_sentence_idx = self.sentence_idx
         self.ui_word_idx = 0  # Current word index for word-level highlighting
-        
-        self.scroll_offset = progress_data["scroll_offset"]
+
+        # 窗口化布局:存储的 scroll_offset 是旧的全书行号,窗口化后无意义。
+        # 先让窗口覆盖进度所在章,再在窗口内重算滚动位置。
+        self._ensure_window(self.chapter_idx)
+
         self.auto_scroll_enabled = progress_data["auto_scroll_enabled"]
         if getattr(config, "UI_MODE_OVERRIDE", False):
             self.speed_reading_enabled = (config.UI_MODE == 3)
@@ -272,14 +275,27 @@ class Lue:
         self.playback_speed = progress_data["playback_speed"]
         if not self.tts_model:
             self.is_paused = True
-            
-        # Restore manual scroll position if available
+
+        # Restore scroll: manual anchor if it maps into the window, else the
+        # restored (c,p,s) position, always clamped to the window.
+        _, height = ui.get_terminal_size()
+        available_height = max(1, height - 4)
+        target_line = None
         manual_anchor = progress_data.get("manual_scroll_anchor")
         if manual_anchor:
             anchor_pos = tuple(manual_anchor)
             if anchor_pos in self.position_to_line:
                 target_line = self.position_to_line[anchor_pos]
-                self.scroll_offset = float(target_line)
+        if target_line is None:
+            key = (self.chapter_idx, self.paragraph_idx, self.sentence_idx)
+            line = self.position_to_line.get(key)
+            if line is not None:
+                target_line = max(0, line - available_height // 2)
+        max_scroll = max(0, len(self.document_lines) - available_height)
+        if target_line is None:
+            self.scroll_offset = 0.0
+        else:
+            self.scroll_offset = float(min(target_line, max_scroll))
                 
     def _initialize_ui_state(self):
         """Initialize UI and interaction state."""
@@ -416,7 +432,15 @@ class Lue:
         except (IndexError, AttributeError, TypeError):
             return False
 
+    def _ensure_window(self, chapter_idx):
+        """确保窗口覆盖 chapter_idx(legado 式按需排版);越界则重建窗口。"""
+        base = getattr(self, '_window_base', None)
+        end = getattr(self, '_window_end', None)
+        if base is None or not (base <= chapter_idx < end):
+            ui.build_window_layout(self, chapter_idx)
+
     def _scroll_to_position(self, chapter_idx, paragraph_idx, sentence_idx, smooth=True):
+        self._ensure_window(chapter_idx)
         if not smooth and self._is_position_visible(chapter_idx, paragraph_idx, sentence_idx): return
         position_key = (chapter_idx, paragraph_idx, sentence_idx)
         if position_key in self.position_to_line:
@@ -898,32 +922,34 @@ class Lue:
             bottom_visible_line,
         )
     
+    def _chapter_progress_fraction(self, chapter_idx):
+        """Reading progress as a fraction, based on chapter position.
+
+        窗口化布局下 document_lines 只覆盖当前窗口,滚动比例不再等于全书
+        进度;进度改为章位置(legado 式):已读章 / 总章,窗口内用滚动
+        比例在相邻章之间插值。
+        """
+        total = max(1, len(self.chapters))
+        idx = min(max(0, chapter_idx), total - 1)
+        return idx / total
+
     def _calculate_progress_percentage(self):
-        if self.total_sentences == 0: return 100.0
-        sentences_read = sum(len(content_parser.split_into_sentences(p)) for i in range(self.chapter_idx) for p in self.chapters[i])
-        if self.chapter_idx < len(self.chapters):
-            sentences_read += sum(len(content_parser.split_into_sentences(self.chapters[self.chapter_idx][i])) for i in range(self.paragraph_idx))
-            sentences_read += self.sentence_idx
-        return (sentences_read / self.total_sentences) * 100
+        return self._chapter_progress_fraction(self.chapter_idx) * 100
 
     def _calculate_ui_progress_percentage(self):
-        """Calculate progress percentage based on current scroll position."""
-        if len(self.document_lines) == 0:
-            return 100.0
-        
-        # Calculate scroll percentage based on current scroll position
-        _, height = ui.get_terminal_size()
-        available_height = max(1, height - 4)
-        max_scroll = max(0, len(self.document_lines) - available_height)
-        
-        if max_scroll == 0:
-            return 100.0
-        
-        scroll_percentage = (self.scroll_offset / max_scroll) * 100
+        """Calculate progress percentage based on chapter position."""
+        frac = self._chapter_progress_fraction(self.ui_chapter_idx)
+        # 窗口内的滚动比例在当前章与下一章之间线性插值
+        window_lines = max(1, len(self.document_lines))
+        in_window = min(max(0.0, self.scroll_offset / window_lines), 1.0)
+        window_span = 1.0 / max(1, len(self.chapters))
+        pct = (frac + in_window * window_span) * 100
+        return min(100.0, max(0.0, pct))
         return min(100.0, max(0.0, scroll_percentage))
 
     def _save_extended_progress(self, sync_audio_position=False):
         if sync_audio_position:
+            self._ensure_window(self.ui_chapter_idx)
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
         
         manual_scroll_anchor = self._get_topmost_visible_sentence()
@@ -944,6 +970,7 @@ class Lue:
         )
 
     def _scroll_to_position_immediate(self, chapter_idx, paragraph_idx, sentence_idx):
+        self._ensure_window(chapter_idx)
         if (chapter_idx, paragraph_idx, sentence_idx) in self.position_to_line:
             target_line = self.position_to_line[(chapter_idx, paragraph_idx, sentence_idx)]
             _, height = ui.get_terminal_size()
@@ -995,6 +1022,7 @@ class Lue:
         new_pos = self._advance_position(current_pos, mode) if direction == 'next' else self._rewind_position(current_pos, mode)
         if new_pos:
             self.first_sentence_jump = False
+            self._ensure_window(new_pos[0])
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = new_pos
             self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = new_pos
             self._scroll_to_position_immediate(*new_pos)
@@ -1006,6 +1034,7 @@ class Lue:
         new_pos = self._advance_position(current_pos, mode) if direction == 'next' else self._rewind_position(current_pos, mode)
         if new_pos:
             self.first_sentence_jump = False
+            self._ensure_window(new_pos[0])
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = new_pos
             self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = new_pos
             # Use smooth scrolling for navigation
@@ -1040,10 +1069,39 @@ class Lue:
             if not self.is_paused and self.running:
                 await audio.play_from_current_position(self)
 
+    def _slide_window(self, direction):
+        """页滚动越过窗口边界时窗口前/后退一章,返回视口需回退的行数偏移。"""
+        base = getattr(self, '_window_base', 0)
+        end = getattr(self, '_window_end', 0)
+        new_center = (base if direction < 0 else end - 1) + direction
+        new_center = max(0, min(len(self.chapters) - 1, new_center))
+        if new_center == base and direction < 0:
+            new_center = max(0, base - 1)
+        old_base = base
+        ui.build_window_layout(self, new_center)
+        if direction < 0:
+            # 视口保持在(原窗口首章在新窗口中)的相同位置
+            return 0
+        # 前进:原窗口第二章成为新窗口首章,视口上移其行数
+        moved = 0
+        rng = self.paragraph_line_ranges.get((old_base + 1, 0)) if old_base + 1 < len(self.chapters) else None
+        if rng:
+            moved = rng[0]
+        return moved
+
     def _handle_page_scroll_immediate(self, direction):
         self.auto_scroll_enabled = False
         page_size = max(1, ui.get_terminal_size()[1] - 4)
-        new_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max(0, len(self.document_lines) - page_size), self.scroll_offset + page_size)
+        max_scroll = max(0, len(self.document_lines) - page_size)
+        new_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max_scroll, self.scroll_offset + page_size)
+        # 越过窗口边界:窗口滑动一章并保持视口连续
+        at_edge = direction > 0 and self.scroll_offset >= max_scroll and getattr(self, '_window_end', 0) < len(self.chapters)
+        if at_edge:
+            delta = self._slide_window(1)
+            new_offset = max(0, self.scroll_offset - delta)
+        elif direction < 0 and self.scroll_offset <= 0 and getattr(self, '_window_base', 0) > 0:
+            self._slide_window(-1)
+            new_offset = max(0, len(self.document_lines) - page_size)
         self.scroll_offset = self.target_scroll_offset = new_offset
         if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
         self._save_extended_progress()
@@ -1051,7 +1109,15 @@ class Lue:
     def _handle_page_scroll_smooth(self, direction):
         self.auto_scroll_enabled = False
         page_size = max(1, ui.get_terminal_size()[1] - 4)
-        target_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max(0, len(self.document_lines) - page_size), self.scroll_offset + page_size)
+        max_scroll = max(0, len(self.document_lines) - page_size)
+        target_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max_scroll, self.scroll_offset + page_size)
+        at_edge = direction > 0 and self.scroll_offset >= max_scroll and getattr(self, '_window_end', 0) < len(self.chapters)
+        if at_edge:
+            delta = self._slide_window(1)
+            target_offset = max(0, self.scroll_offset - delta)
+        elif direction < 0 and self.scroll_offset <= 0 and getattr(self, '_window_base', 0) > 0:
+            self._slide_window(-1)
+            target_offset = max(0, len(self.document_lines) - page_size)
         if config.SMOOTH_SCROLLING_ENABLED:
             self._smooth_scroll_to(target_offset)
         else:

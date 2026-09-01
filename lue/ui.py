@@ -147,164 +147,159 @@ def get_terminal_size():
     except OSError:
         return 80, 24
 
-def update_document_layout(reader):
-    """Update the document layout based on terminal size.
-
-    布局构建（rich 的逐段 wrap 测量）在大文档上开销显著，而 UI 模式切换
-    （v 键）只在 available_width 变化时才需要重建，因此按宽度缓存布局，
-    命中时直接复用，消除模式切换时的卡顿。
-    """
+def _available_text_width():
+    """Text width for the current UI mode."""
     width, _ = get_terminal_size()
-
-    # Adjust available width based on UI mode
     if config.UI_MODE == 0 or config.UI_MODE == 3:
-        # Mode 0 or 3: Full screen width for text
-        available_width = width
+        return width
+    return max(20, width - 10)
+
+
+# 窗口化布局(legado 式):document_lines 等结构只包含当前章 ± 邻章的行,
+# 打开书不再排版整本书——首屏只等解析 + ~10ms 的窗口构建。跳章/滚动越界
+# 时由 reader._ensure_window 重建窗口(瞬时)。
+WINDOW_CHAPTERS_BEFORE = 1
+WINDOW_CHAPTERS_AFTER = 2
+
+
+def window_range(reader, center_chapter):
+    """Chapter range [start, end) covered by a window centered on center_chapter."""
+    total = len(reader.chapters)
+    start = max(0, center_chapter - WINDOW_CHAPTERS_BEFORE)
+    end = min(total, center_chapter + 1 + WINDOW_CHAPTERS_AFTER)
+    return start, end
+
+
+def build_window_layout(reader, center_chapter):
+    """(Re)build document_lines and friends for the window around center_chapter.
+
+    Structures keep their global chapter numbers in keys (ranges/positions),
+    while line numbers are window-relative starting at 0 — the reader's
+    scroll state is also window-relative. Falls back to the pure-Python
+    per-paragraph path when the Rust extension is unavailable.
+    """
+    base, end = window_range(reader, center_chapter)
+    window_chapters = reader.chapters[base:end]
+    available_width = _available_text_width()
+
+    if _rust.lue_rs is not None:
+        try:
+            (
+                document_lines,
+                pos_keys,
+                pos_vals,
+                l2p_keys,
+                l2p_vals,
+                range_keys,
+                range_vals,
+                sorted_positions,
+                sorted_lines,
+                _total,
+            ) = _rust.lue_rs.layout_document(window_chapters, available_width)
+            # 平移到全局章号(布局输出使用窗口相对章号 0..n)
+            if base:
+                pos_keys = [(c + base, p, s) for (c, p, s) in pos_keys]
+                l2p_vals = [(c + base, p, s) for (c, p, s) in l2p_vals]
+                range_keys = [(c + base, p) for (c, p) in range_keys]
+                sorted_positions = [(c + base, p, s) for (c, p, s) in sorted_positions]
+            reader.document_lines = document_lines
+            reader.position_to_line = dict(zip(pos_keys, pos_vals))
+            reader.line_to_position = dict(zip(l2p_keys, l2p_vals))
+            reader.paragraph_line_ranges = dict(zip(range_keys, range_vals))
+            reader._sorted_line_positions = (sorted_positions, sorted_lines)
+        except _rust._PANIC_TYPES:
+            _build_window_layout_py(reader, base, end, available_width)
     else:
-        # Mode 1 and 2: Account for borders and padding
-        available_width = max(20, width - 10)
+        _build_window_layout_py(reader, base, end, available_width)
+
+    reader._window_base = base
+    reader._window_end = end
+    # 宽度内存缓存:同一宽度重建窗口(v 键/resize)直接复用
+    cache = getattr(reader, '_layout_cache', None)
+    if cache is None:
+        cache = reader._layout_cache = {}
+    cache[available_width] = {
+        'base': base,
+        'end': end,
+        'lines': reader.document_lines,
+        'line_to_position': reader.line_to_position,
+        'position_to_line': reader.position_to_line,
+        'paragraph_ranges': reader.paragraph_line_ranges,
+        'sorted_index': reader._sorted_line_positions,
+    }
+
+
+def _build_window_layout_py(reader, base, end, available_width):
+    """Pure-Python window layout (rich wrap fallback), same output shape."""
+    document_lines = []
+    position_to_line = {}
+    line_to_position = {}
+    paragraph_line_ranges = {}
+    for idx, chapter in enumerate(reader.chapters[base:end]):
+        chap_idx = base + idx
+        if idx > 0:
+            document_lines.append("")
+        for para_idx, paragraph in enumerate(chapter):
+            paragraph_start_line = len(document_lines)
+            plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
+            wrapped_plains = [line.plain for line in plain_text.wrap(reader.console, available_width)]
+            sentences = content_parser.split_into_sentences(paragraph)
+            paragraph_line_ranges[(chap_idx, para_idx)] = (
+                paragraph_start_line,
+                paragraph_start_line + len(wrapped_plains) - 1,
+            )
+            line_idx = 0
+            line_offset = 0
+            current_char_pos = 0
+            for sent_idx, sentence in enumerate(sentences):
+                sentence_start = current_char_pos
+                while (
+                    line_idx < len(wrapped_plains)
+                    and sentence_start >= line_offset + len(wrapped_plains[line_idx])
+                ):
+                    line_offset += len(wrapped_plains[line_idx])
+                    line_idx += 1
+                if line_idx < len(wrapped_plains):
+                    position_to_line[(chap_idx, para_idx, sent_idx)] = paragraph_start_line + line_idx
+                current_char_pos = sentence_start + len(sentence) + 1
+            for k in range(len(wrapped_plains)):
+                line_to_position[paragraph_start_line + k] = (chap_idx, para_idx, 0)
+            document_lines.extend(wrapped_plains)
+            if para_idx < len(chapter) - 1:
+                document_lines.append("")
+    sorted_items = sorted(position_to_line.items(), key=lambda kv: kv[1])
+    reader.document_lines = document_lines
+    reader.position_to_line = position_to_line
+    reader.line_to_position = line_to_position
+    reader.paragraph_line_ranges = paragraph_line_ranges
+    reader._sorted_line_positions = (
+        [pos for pos, _ in sorted_items],
+        [ln for _, ln in sorted_items],
+    )
+
+
+def update_document_layout(reader):
+    """Rebuild the layout for the reader's current window (resize / v key).
+
+    窗口化布局下这里只重排当前窗口(~10ms),不再触碰整本书。缓存命中
+    (同宽度同窗口)时直接复用。
+    """
+    center = getattr(reader, 'ui_chapter_idx', 0)
+    base, end = window_range(reader, center)
+    available_width = _available_text_width()
 
     cache = getattr(reader, '_layout_cache', None)
     cached = cache.get(available_width) if cache else None
-    disk_layout = None
-    if not cached:
-        # 布局磁盘缓存:同一书在同一宽度下跳过整书 wrap 重建(v 键/resize
-        # 切换宽度会重建一次并写回;书内容变化按 mtime+size 失效)
-        try:
-            disk_layout = cache_mod.LayoutCache(
-                reader.file_path,
-                cache_mod.LayoutCache.key_for(os.stat(reader.file_path), available_width),
-            ).load()
-        except Exception:
-            disk_layout = None
-    if cached:
+    if cached and cached.get('base') == base and cached.get('end') == end:
         reader.document_lines = cached['lines']
         reader.line_to_position = cached['line_to_position']
         reader.position_to_line = cached['position_to_line']
         reader.paragraph_line_ranges = cached['paragraph_ranges']
         reader._sorted_line_positions = cached['sorted_index']
-        reader.total_sentences = cached.get('total_sentences', 0)
-    elif disk_layout is not None:
-        # 与 rebuild 一致:document_lines 存普通 str,渲染时才转 Text
-        reader.document_lines = disk_layout['lines']
-        reader.line_to_position = disk_layout['line_to_position']
-        reader.position_to_line = disk_layout['position_to_line']
-        reader.paragraph_line_ranges = disk_layout['paragraph_ranges']
-        reader._sorted_line_positions = disk_layout['sorted_index']
-        reader.total_sentences = disk_layout['total_sentences']
+        reader._window_base = base
+        reader._window_end = end
     else:
-        # 布局重建:整书一次 Rust 调用完成 wrap + 句子切分 + 句→行映射 +
-        # 索引构建;Python 侧只做 C 级 dict(zip()) 转换。无 Rust 时回退
-        # rich 逐段 wrap 的纯 Python 路径。
-        if _rust.lue_rs is not None:
-            try:
-                (
-                    document_lines,
-                    pos_keys,
-                    pos_vals,
-                    l2p_keys,
-                    l2p_vals,
-                    range_keys,
-                    range_vals,
-                    sorted_positions,
-                    sorted_lines,
-                    total_sentences,
-                ) = _rust.lue_rs.layout_document(reader.chapters, available_width)
-                reader.document_lines = document_lines
-                reader.position_to_line = dict(zip(pos_keys, pos_vals))
-                reader.line_to_position = dict(zip(l2p_keys, l2p_vals))
-                reader.paragraph_line_ranges = dict(zip(range_keys, range_vals))
-                sorted_index = (sorted_positions, sorted_lines)
-            except _rust._PANIC_TYPES:
-                sorted_index = None
-        else:
-            sorted_index = None
-
-        if sorted_index is None:
-            reader.document_lines = []
-            reader.line_to_position = {}
-            reader.position_to_line = {}
-            reader.paragraph_line_ranges = {}
-            total_sentences = 0
-            for chap_idx, chapter in enumerate(reader.chapters):
-                if chap_idx > 0:
-                    reader.document_lines.append("")
-
-                for para_idx, paragraph in enumerate(chapter):
-                    paragraph_start_line = len(reader.document_lines)
-                    plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
-                    wrapped_plains = [line.plain for line in plain_text.wrap(reader.console, available_width)]
-                    sentences = content_parser.split_into_sentences(paragraph)
-                    total_sentences += len(sentences)
-                    paragraph_end_line = paragraph_start_line + len(wrapped_plains) - 1
-                    reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
-                    # 双指针线性定位句首所在行(与 Rust 版语义一致)
-                    line_idx = 0
-                    line_offset = 0
-                    current_char_pos = 0
-                    for sent_idx, sentence in enumerate(sentences):
-                        sentence_start = current_char_pos
-                        while (
-                            line_idx < len(wrapped_plains)
-                            and sentence_start >= line_offset + len(wrapped_plains[line_idx])
-                        ):
-                            line_offset += len(wrapped_plains[line_idx])
-                            line_idx += 1
-                        if line_idx < len(wrapped_plains):
-                            reader.position_to_line[(chap_idx, para_idx, sent_idx)] = paragraph_start_line + line_idx
-                        current_char_pos = sentence_start + len(sentence) + 1
-
-                    for line_idx in range(len(wrapped_plains)):
-                        reader.line_to_position[paragraph_start_line + line_idx] = (chap_idx, para_idx, 0)
-
-                    reader.document_lines.extend(wrapped_plains)
-
-                    if para_idx < len(chapter) - 1:
-                        reader.document_lines.append("")
-            # 按行排序的 (positions, lines) 平行数组(稳定排序保持插入序)
-            sorted_items = sorted(reader.position_to_line.items(), key=lambda kv: kv[1])
-            sorted_index = (
-                [pos for pos, _ in sorted_items],
-                [ln for _, ln in sorted_items],
-            )
-
-        if cache is None:
-            cache = reader._layout_cache = {}
-        reader._sorted_line_positions = sorted_index
-        reader.total_sentences = total_sentences
-        cache[available_width] = {
-            'lines': reader.document_lines,
-            'line_to_position': reader.line_to_position,
-            'position_to_line': reader.position_to_line,
-            'paragraph_ranges': reader.paragraph_line_ranges,
-            'sorted_index': sorted_index,
-            'total_sentences': total_sentences,
-        }
-        # 持久化布局缓存(后台线程写盘,不阻塞渲染也不依赖事件循环
-        # 状态;asyncio.get_event_loop 在无事件循环的同步加载期会抛错)
-        try:
-            import threading
-
-            layout_payload = cache[available_width]
-
-            def _persist_layout():
-                try:
-                    cache_mod.LayoutCache(
-                        reader.file_path,
-                        cache_mod.LayoutCache.key_for(
-                            os.stat(reader.file_path), available_width
-                        ),
-                    ).store(layout_payload)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_persist_layout, daemon=True).start()
-        except Exception:
-            pass
-        # 只保留最近使用的两个宽度，避免终端频繁 resize 时内存无限增长
-        if len(cache) > 2:
-            for old_width in sorted(cache.keys())[:-2]:
-                del cache[old_width]
+        build_window_layout(reader, center)
 
     if hasattr(reader, '_initial_load_complete') and reader._initial_load_complete:
         scroll_was_set = False
@@ -391,6 +386,19 @@ def _apply_current_text_color(line):
 
 def get_visible_content(reader):
     """Get the visible content to display."""
+    # 兜底网:任何未挂 _ensure_window 的路径(TTS 推进、命令跳转等)把
+    # 阅读位置移出窗口时,在渲染前自愈一次
+    base = getattr(reader, '_window_base', None)
+    end = getattr(reader, '_window_end', None)
+    ui_chapter = getattr(reader, 'ui_chapter_idx', 0)
+    if base is None or not (base <= ui_chapter < end):
+        build_window_layout(reader, ui_chapter)
+
+    # 兜底:滚动位置越界(窗口重建/进度恢复等)时先收敛,避免取空视口
+    max_line = max(0, len(reader.document_lines) - 1)
+    if reader.document_lines and reader.scroll_offset > max_line:
+        reader.scroll_offset = reader.target_scroll_offset = float(max_line)
+
     width, height = get_terminal_size()
     
     # Adjust available space based on UI mode

@@ -16,6 +16,9 @@ cd ~/lue-src/rust
 
 "$PY" -m pip install --force-reinstall --no-deps \
     ~/lue-src/rust/target/wheels/lue_rs-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl 2>&1 | tail -1
+
+# Refresh the lue Python package too (windowed layout and other changes live here)
+pipx install --force --pip-args='--index-url https://pypi.tuna.tsinghua.edu.cn/simple' ~/lue-src 2>&1 | tail -1
 rm -rf ~/lue-src
 
 echo "--- installed .so ---"
