@@ -116,15 +116,46 @@ class Lue:
         # total_sentences 不再独立统计(布局重建时顺手累加);缓存损坏/
         # 不匹配一律回退完整解析。
         cache_hit = False
+        stat = None
         try:
             stat = os.stat(self.file_path)
-            self._parsed_cache = cache.ParsedBookCache(self.file_path, cache.ParsedBookCache.key_for(stat))
-            loaded = self._parsed_cache.load()
-            if loaded is not None:
-                self.chapters = loaded
-                cache_hit = True
         except Exception:
-            loaded = None
+            pass
+
+        # TXT 随机访问索引:字节区间章索引(持久化)+ 惰性章解码。
+        # 打开成本 = 读索引(~20ms)+ 当前窗口 3 章解码,与全书大小无关;
+        # 非 TXT、无 Rust 扩展或索引不可用时回退全量解析。
+        is_txt = self.file_path.lower().endswith(".txt")
+        if is_txt and stat is not None and _rust.lue_rs is not None:
+            try:
+                index_cache = cache.TxtIndexCache(self.file_path, cache.TxtIndexCache.key_for(stat))
+                idx = index_cache.load()
+                if idx is None:
+                    encoding, intro_first, starts, ends = _rust.lue_rs.build_txt_index(self.file_path)
+                    if encoding:
+                        index_cache.store(encoding, starts, ends, intro_first)
+                    else:
+                        raise ValueError("book not lazily indexable")
+                else:
+                    encoding = idx["encoding"]
+                    starts, ends = idx["starts"], idx["ends"]
+                    intro_first = idx["intro_first"]
+                from .lazy_book import LazyChapters
+                self.chapters = LazyChapters(self.file_path, encoding, starts, ends, intro_first)
+                cache_hit = True
+            except Exception:
+                cache_hit = False
+
+        if not cache_hit:
+            try:
+                if stat is not None:
+                    self._parsed_cache = cache.ParsedBookCache(self.file_path, cache.ParsedBookCache.key_for(stat))
+                    loaded = self._parsed_cache.load()
+                    if loaded is not None:
+                        self.chapters = loaded
+                        cache_hit = True
+            except Exception:
+                loaded = None
 
         if not cache_hit:
             self.chapters = content_parser.extract_content(self.file_path, self.console)
@@ -139,16 +170,18 @@ class Lue:
             try:
                 import threading
 
-                parsed_cache = self._parsed_cache
+                parsed_cache = getattr(self, "_parsed_cache", None)
                 chapters = self.chapters
 
                 def _persist_parsed():
                     try:
-                        parsed_cache.store(chapters)
+                        if parsed_cache is not None:
+                            parsed_cache.store(chapters)
                     except Exception:
                         pass
 
-                threading.Thread(target=_persist_parsed, daemon=True).start()
+                if parsed_cache is not None:
+                    threading.Thread(target=_persist_parsed, daemon=True).start()
             except Exception:
                 pass
 

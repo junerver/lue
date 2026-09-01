@@ -89,3 +89,44 @@ class ParsedBookCache(_BaseCache):
 
     def store(self, chapters) -> None:
         self._store({"chapters": chapters})
+
+
+class TxtIndexCache(_BaseCache):
+    """Persists the TXT byte-range chapter index (encoding + chapter spans).
+
+    Keyed by (mtime, size) like ParsedBookCache. A hit turns a cold open into
+    a ~20ms index load instead of a full-file rescan; the decoded chapters
+    themselves stay lazy (see lazy_book.LazyChapters).
+    """
+
+    _dir = "txt-index"
+
+    @classmethod
+    def key_for(cls, stat) -> str:
+        return f"m{int(stat.st_mtime_ns)}-s{stat.st_size}"
+
+    def load(self):
+        data = self._load()
+        if not isinstance(data, dict):
+            return None
+        encoding = data.get("encoding")
+        starts = data.get("starts")
+        ends = data.get("ends")
+        if not encoding or not isinstance(starts, list) or not isinstance(ends, list):
+            return None
+        if not starts or len(starts) != len(ends):
+            return None
+        return {
+            "encoding": encoding,
+            "starts": starts,
+            "ends": ends,
+            "intro_first": bool(data.get("intro_first", False)),
+        }
+
+    def store(self, encoding, starts, ends, intro_first) -> None:
+        self._store({
+            "encoding": encoding,
+            "starts": list(starts),
+            "ends": list(ends),
+            "intro_first": bool(intro_first),
+        })

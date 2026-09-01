@@ -121,7 +121,31 @@ span,rich 的 divide 会把 span 分配到各行,Rust 纯文本版不能替换 �
 测量也纠正了一个预判:每帧的高亮段落构建 + wrap 实测仅 0.29 ms,不需要
 优化;`get_visible_content` 保持原样。
 
-## 阶段 4(可选):剩余候选
+## 阶段 4(已完成):TXT 随机访问索引 + 惰性章节
+
+受 legado `TextFile.kt` 的 byte-offset chapter slice 启发，TXT 的主路径
+(中文、每行一段、标题分章)不再把全书读进 Python `str` / `List[List[str]]`：
+
+- Rust `build_txt_index(path)`一次扫描原始字节，探测编码(UTF-8/UTF-8 BOM/
+  GB18030/Latin-1)，复用 legado TOC 评分规则，产出章节 `(start,end)` **原始
+  字节区间**；
+- `TxtIndexCache`按 `(canonical path, mtime_ns, size)` 持久化编码与区间，缓存
+  是可丢失的 derived data；
+- Python `LazyChapters`保持原有序列接口，按需 `seek + read + decode + clean`
+  单章，LRU 仅留 64 章；窗口布局自然只解码当前章邻居；
+- 不符合该安全轮廓的 TXT(无标题、英文合段、超长单行)和其他格式完整保留
+  全量解析回退，行为不回归。
+
+真实 WSL 测试(`高考.txt`,11.7MB,1097章)：首次建立索引约 269ms；索引缓存
+命中时打开当前 3 章窗口约 **14ms**；从首章跳到第 500 章窗口 **7ms**，返回
+首章 **1ms**。这使主打开路径近似 `O(index lookup + current window)`，而不是
+`O(book size + whole-book layout)`。
+
+等价性:`tests/test_lazy_index.py`对 UTF-8、GB18030、UTF-8 BOM 的标题分章
+小说逐章对比 `LazyChapters` 与原全量 `_extract_content_txt` 输出；同时覆盖
+前言、切片、LRU 触发。所有 136 pytest 用例通过。
+
+## 阶段 5(可选):剩余候选
 
 `input_handler` 的转义序列解析、逐帧 ANSI 渲染、`timing_calculator` 的
 词对齐模糊匹配。渲染部分是 I/O 密集,收益有限;输入解析体量小,适合整体搬。

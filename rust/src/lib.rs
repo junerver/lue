@@ -947,6 +947,139 @@ fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
     wrap_plain(text, width)
 }
 
+/// TXT random-access index (legado TextFile.kt style): scan the file once,
+/// detect the encoding, pick the TOC rule and record the byte range of every
+/// chapter so opening a book never needs to decode/parse the whole text.
+///
+/// Returns `(encoding, intro_first, starts, ends)` — byte offsets into the
+/// raw file. `intro_first` marks the leading preface chapter (before the
+/// first title line), which parses with slightly different paragraph rules.
+/// Returns `encoding = ""` when the book does not match the lazy-eligible
+/// profile (non-Chinese layout, no title rule, single-line wall of text…);
+/// callers fall back to the full in-memory parse.
+#[pyfunction]
+fn build_txt_index(path: &str) -> (String, bool, Vec<u64>, Vec<u64>) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+
+        Err(_) => return (String::new(), false, Vec::new(), Vec::new()),
+    };
+
+    // Encoding probe, same cascade as _read_text_with_encoding_detect:
+    // BOM -> utf-8; else strict utf-8; else strict gb18030; else latin-1.
+    let (encoding, content) = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        match std::str::from_utf8(&bytes[3..]) {
+            Ok(s) => ("utf-8-sig".to_string(), s.to_string()),
+            Err(_) => decode_gb18030_or_latin1(&bytes),
+        }
+    } else if std::str::from_utf8(&bytes).is_ok() {
+        ("utf-8".to_string(), String::from_utf8_lossy(&bytes).into_owned())
+    } else {
+        decode_gb18030_or_latin1(&bytes)
+    };
+
+    let content = content.replace("\r\n", "\n").replace('\r', "\n");
+    let raw_lines: Vec<&str> = content.split('\n').collect();
+    if !raw_lines.iter().any(|l| !l.trim().is_empty()) {
+        return (String::new(), false, Vec::new(), Vec::new());
+    }
+
+    // Line start offsets in RAW file bytes. 0x0A is a safe line delimiter for
+    // UTF-8 (continuation bytes are >= 0x80) and GB18030 (trail bytes are
+    // 0x40-0xFE), so raw byte scanning matches the decoded line order 1:1.
+    let mut line_starts: Vec<u64> = Vec::with_capacity(raw_lines.len());
+    line_starts.push(if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { 3u64 } else { 0u64 });
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == 0x0A {
+            line_starts.push((i + 1) as u64);
+        }
+    }
+
+    // Paragraph-strategy gate: only the "one line = one paragraph Chinese
+    // novel with titled chapters" profile is lazily indexed.
+    let (cjk_count, cjk_total) = analyze_cjk_impl(&content);
+    if cjk_count == 0 {
+        return (String::new(), false, Vec::new(), Vec::new());
+    }
+    let is_chinese = cjk_count as f64 / raw_lines.len() as f64 > 0.5;
+    let cjk_avg_len = cjk_total as f64 / cjk_count as f64;
+    let nonempty_lines = raw_lines.iter().filter(|l| !l.trim().is_empty()).count();
+    if !is_chinese || cjk_avg_len > 120.0 || nonempty_lines <= 1 {
+        return (String::new(), false, Vec::new(), Vec::new());
+    }
+    if content.len() as u64 > line_starts[line_starts.len() - 1] as u64 {
+        // content shorter than raw bytes means heavy \r\n usage; still fine —
+        // this check is a cheap sanity guard only.
+    }
+
+    let sample_chars: usize = content
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| i > 500 * 1024)
+        .unwrap_or(content.len());
+    let rule_idx = match pick_toc_rule_impl(&content[..sample_chars]) {
+        Some(r) => r,
+        None => return (String::new(), false, Vec::new(), Vec::new()),
+    };
+    let title_lines = collect_title_lines_impl(&content, rule_idx);
+    if title_lines.is_empty() {
+        return (String::new(), false, Vec::new(), Vec::new());
+    }
+
+    // Chapter byte ranges: each title line starts a chapter that runs until
+    // the next title line. Content before the first title becomes a preface
+    // chapter when non-empty.
+    let file_len = bytes.len() as u64;
+    let line_start = |t: u64| -> u64 {
+        line_starts
+            .get(t as usize)
+            .cloned()
+            .unwrap_or(file_len)
+    };
+    let mut starts: Vec<u64> = Vec::new();
+    let mut ends: Vec<u64> = Vec::new();
+    let first_title = title_lines[0];
+    let mut intro_first = false;
+    if first_title > 0 {
+        // preface only counts when it holds at least one non-blank line
+        let has_text = raw_lines[..first_title as usize]
+            .iter()
+            .any(|l| !l.trim().is_empty());
+        if has_text {
+            starts.push(0);
+            ends.push(line_start(first_title));
+            intro_first = true;
+        }
+    }
+    for (k, &t) in title_lines.iter().enumerate() {
+        let s = line_start(t);
+        let e = title_lines
+            .get(k + 1)
+            .map(|&next| line_start(next))
+            .unwrap_or(file_len);
+        if e > s {
+            starts.push(s);
+            ends.push(e);
+        }
+    }
+    if starts.is_empty() {
+        return (String::new(), false, Vec::new(), Vec::new());
+    }
+    (encoding, intro_first, starts, ends)
+}
+
+fn decode_gb18030_or_latin1(bytes: &[u8]) -> (String, String) {
+    let (cow, _enc, had_errors) = encoding_rs::GB18030.decode(bytes);
+    if !had_errors {
+        ("gb18030".to_string(), cow.into_owned())
+    } else {
+        (
+            "latin-1".to_string(),
+            bytes.iter().map(|&b| b as char).collect(),
+        )
+    }
+}
+
 /// Whole-document layout in one Rust call: wraps every paragraph, builds
 /// the sentence->line index, line->paragraph index, paragraph ranges and
 /// the line-sorted position index. Returns flat parallel vectors that
@@ -1056,6 +1189,7 @@ fn lue_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(wrap_paragraph, m)?)?;
     m.add_function(wrap_pyfunction!(layout_paragraph, m)?)?;
     m.add_function(wrap_pyfunction!(layout_document, m)?)?;
+    m.add_function(wrap_pyfunction!(build_txt_index, m)?)?;
     m.add_function(wrap_pyfunction!(char_cell_width_py, m)?)?;
     m.add_function(wrap_pyfunction!(cell_len_py, m)?)?;
     m.add_function(wrap_pyfunction!(expand_tabs_py, m)?)?;
