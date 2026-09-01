@@ -1,0 +1,34 @@
+{
+  "navigation": {
+    "next_paragraph": "j",
+    "prev_paragraph": "k",
+    "next_sentence": ")",
+    "prev_sentence": "(",
+    "scroll_page_up": "\u0002",
+    "scroll_page_down": "\u0006",
+    "scroll_up": "\u0015",
+    "scroll_down": "\u0004",
+    "move_to_top_visible": "H",
+    "next_chapter": "x",
+    "prev_chapter": "z",
+    "move_to_beginning": "g",
+    "move_to_end": "G"
+  },
+  "tts_controls": {
+    "play_pause": ["p", " "],
+    "decrease_speed": ",",
+    "increase_speed": ".",
+    "toggle_sentence_highlight": "s",
+    "toggle_word_highlight": "w"
+  },
+  "display_controls": {
+    "toggle_auto_scroll": "a",
+    "cycle_ui_complexity": "v",
+    "toggle_chapter_index": "c"
+  },
+  "application": {
+    "quit": "q",
+    "toggle_recent_menu": "r",
+    "select_menu_item": "\n"
+  }
+}

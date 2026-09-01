@@ -2,17 +2,18 @@
 name = "lue_rs"
 version = "0.1.0"
 edition = "2021"
-description = "Rust accelerator for the lue terminal eBook reader (text pipeline hot paths)"
+description = "PyO3 bindings over lue_core for the lue terminal eBook reader"
 
 [lib]
 name = "lue_rs"
 crate-type = ["cdylib", "rlib"]
 
+[workspace]
+members = ["core", "app"]
+
 [dependencies]
+lue_core = { path = "core" }
 pyo3 = { version = "0.23", features = ["extension-module"] }
-fancy-regex = "0.14"
-regex = "1.13.1"
-encoding_rs = "0.8.35"
 
 [profile.release]
 lto = true

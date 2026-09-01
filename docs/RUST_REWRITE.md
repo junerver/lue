@@ -145,16 +145,42 @@ span,rich 的 divide 会把 span 分配到各行,Rust 纯文本版不能替换 �
 小说逐章对比 `LazyChapters` 与原全量 `_extract_content_txt` 输出；同时覆盖
 前言、切片、LRU 触发。所有 136 pytest 用例通过。
 
-## 阶段 5(可选):剩余候选
+## 阶段 5(已完成):纯 Rust 应用与二进制交付
 
-`input_handler` 的转义序列解析、逐帧 ANSI 渲染、`timing_calculator` 的
-词对齐模糊匹配。渲染部分是 I/O 密集,收益有限;输入解析体量小,适合整体搬。
+workspace 拆成三层(`rust/`),原 `lue_rs` 单体按依赖方向解耦:
 
-## 阶段 5(远期):完全重写
+```text
+rust/
+├── core/   lue_core — 纯逻辑库,零 Python 依赖
+│           text.rs(句切/清洗/CJK)、toc.rs(章节规则)、wrap.rs(Rich 逐字节
+│           复刻换行)、layout.rs(layout_paragraph/layout_document)、
+│           book.rs(TxtBook 随机访问句柄 + build_txt_index)
+├── src/    lue_rs — PyO3 薄绑定层,函数签名与异常类型保持不变
+│           (LueError::Io→OSError、Decode→UnicodeDecodeError、Invalid→ValueError)
+└── app/    lue — Ratatui/Crossterm 原生二进制,零 Python 依赖
+```
 
-届时 `lue_rs` 演进为完整的 Rust 渲染/状态核心,Python 薄壳只做 TTS 插件与
-CLI 胶水(或最终用 cargo 直接产出可执行文件)。TTS(edge-tts/kokoro)保持
-Python 侧,不建议迁移。
+`lue` 二进制(`rust/app`)实现:clap CLI(`lue <book>`、`lue list`、
+`lue clear`、`--mode`、`--keys default|vim`、`--guide`);窗口化阅读状态机
+(当前章 ±1/2 的解码与布局、视口滚动、锚点式 resize);章节索引弹层
+(输入过滤 + Enter 跳转)、最近书目菜单、鼠标滚轮与进度条点击跳章;
+进度记录与 Python 版完全互通(同目录同文件名规则同 JSON 字段,含
+`manual_scroll_anchor [c,p,s]` 与 CJK 安全命名);TXT 索引磁盘缓存
+(独立 JSON 格式,不与 Python pickle 缓存互读)。键位定义直接复用
+`keys_default.json`/`keys_vim.json`(`include_str!` 编译期内嵌)。
+
+WSL 实测(2026-09-01):高考.txt 11.8 MB / 1097 章冷开索引 64 ms;
+魅力.txt 18.6 MB / 857 章 117 ms(读 30 ms + 扫描 87 ms)。
+`lue-rs list` 直接读出 Python 版写入的进度记录,互通验证通过。
+
+验证:Rust 13 测试(core 7 + app 单元 5 + 集成 1)+ Python 149 pytest
+全过(绑定层重构零回归)。
+
+## 阶段 6(可选):剩余候选
+
+`input_handler` 的转义序列解析、`timing_calculator` 的词对齐模糊匹配。
+原生二进制的 TTS(edge-tts WebSocket + 播放,进程隔离或 Rust 原生)、
+EPUB/MD 等其余格式的 Rust 解析、`kokoro` 保持 Python 侧不建议迁移。
 
 ## 已知边界与安全说明
 

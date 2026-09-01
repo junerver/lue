@@ -18,11 +18,40 @@ Lue-rs is a performance fork of [Lue](https://github.com/paulilaaso/lue), a vers
 | ------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------- |
 | **Parsing & layout**      | Pure Python                                     | Hot paths rewritten in Rust (PyO3): sentence splitting, text cleaning, TXT chapter-rule scanning, line layout |
 | **Document model**        | Reads and parses the whole file up front        | Windowed rendering: the reader never loads the full book — a byte-level TXT index enables random access, and only the current chapter (± a small window) is decoded and laid out |
-| **Startup**               | Grows with book size (an 11 MB novel took ~4 s) | Near-instant: ~0.6 s cold open (building the index once), 11–45 ms warm opens, ~7 ms chapter jumps on the same 11 MB / 1097-chapter novel (WSL) |
+| **Startup**               | Grows with book size (an 11 MB novel took ~4 s) | Near-instant: ~0.1 s cold open (indexing an 11 MB / 1097-chapter novel takes 64 ms), 11–45 ms warm opens, ~7 ms chapter jumps |
+| **Native binary**         | Python package only                             | A pure-Rust Ratatui binary (`lue`, in `rust/app`) with zero Python dependency — see [Pure Rust binary](#pure-rust-binary) |
 | **Startup pipeline**      | TTS + audio stack initialized eagerly          | Simplified launch: TTS disabled by default, heavy imports deferred, parsed/index/layout results cached on disk |
 | **Management commands**   | —                                               | `lue list` (reading history) and `lue clear` (records + caches)                   |
 
-The Rust accelerator is **optional**: without the `lue_rs` wheel everything falls back to the retained pure-Python implementations, and `LUE_NO_RUST=1` disables it at runtime for A/B testing. See [docs/RUST_REWRITE.md](docs/RUST_REWRITE.md) for the architecture notes.
+The Rust accelerator is **optional** in the Python package: without the `lue_rs` wheel everything falls back to the retained pure-Python implementations, and `LUE_NO_RUST=1` disables it at runtime for A/B testing. See [docs/RUST_REWRITE.md](docs/RUST_REWRITE.md) for the architecture notes.
+
+---
+
+## Pure Rust binary
+
+The native build is a standalone Ratatui/Crossterm terminal reader with **no Python dependency**. It currently opens titled Chinese TXT books (the chapter-index fast path) and reads/writes the same progress records as the Python build, so your history and positions carry over.
+
+```bash
+# from the repository root: build everything (PyO3 wheel + native binary)
+(cd rust && cargo build --release --workspace)
+
+# the binary lands here
+rust/target/release/lue            # lue.exe on Windows
+
+# open a book
+rust/target/release/lue path/to/book.txt
+
+# same management commands as the Python build
+rust/target/release/lue list
+rust/target/release/lue clear
+
+# install for daily use (optional)
+cp rust/target/release/lue ~/.local/bin/lue-rs
+```
+
+Keys: `j`/`k` line, `h`/`l` paragraph, `u`/`n` small scroll, `i`/`m` page, `z`/`x` chapter, `c` chapter index (type-to-filter), `r` recent books, `y`/`b` start/end, `v` UI mode, `q` quit; arrows, PgUp/PgDn, Home/End, mouse wheel and progress-bar clicks work too. `--keys vim` selects the Vim layout, `lue --guide` prints the cheat sheet.
+
+TTS is not wired into the native binary yet (it reads silently); the Python build remains the full-featured TTS client. Other formats (EPUB/PDF/DOCX/HTML/RTF/MD) are planned for the native parser in later phases — see the roadmap.
 
 ---
 
@@ -283,7 +312,7 @@ Lue-rs allows you to customize the color theme, visual icons/symbols and all ui 
 
 > **Interested in extending Lue-rs?**
 
-The Rust accelerator lives in [rust/](rust/) (a PyO3 crate built with maturin); its architecture and roadmap are documented in [docs/RUST_REWRITE.md](docs/RUST_REWRITE.md). Check out the [Developer Guide](DEVELOPER.md) for instructions on adding new TTS models and contributing to the project.
+The engine lives in [rust/](rust/) as a three-crate workspace: `core/` is the pure-Rust document library, `src/` holds the PyO3 bindings consumed by the Python package, and `app/` builds the native `lue` binary. Architecture and roadmap are documented in [docs/RUST_REWRITE.md](docs/RUST_REWRITE.md); check out the [Developer Guide](DEVELOPER.md) for adding new TTS models to the Python build.
 
 ### Data Storage
 

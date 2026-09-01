@@ -19,7 +19,18 @@ cd ~/lue-src/rust
 
 # Refresh the lue Python package too (windowed layout and other changes live here)
 pipx install --force --pip-args='--index-url https://pypi.tuna.tsinghua.edu.cn/simple' ~/lue-src 2>&1 | tail -1
+
+# Build and install the pure-Rust binary (lue-rs) next to the Python entry point
+source "$HOME/.cargo/env"
+cd ~/lue-src/rust
+cargo build --release --workspace 2>&1 | tail -1
+mkdir -p ~/.local/bin
+cp target/release/lue ~/.local/bin/lue-rs
+~/.local/bin/lue-rs --version
+
 rm -rf ~/lue-src
 
 echo "--- installed .so ---"
 ls -la "$VENV/lib/python3.12/site-packages/lue_rs/"*.so
+echo "--- installed native binary ---"
+ls -la ~/.local/bin/lue-rs
