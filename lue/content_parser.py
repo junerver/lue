@@ -2,10 +2,6 @@ import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-import pymupdf
-import markdown
-from docx import Document
-from striprtf.striprtf import rtf_to_text
 import subprocess
 import string
 from functools import lru_cache
@@ -17,6 +13,9 @@ from html import unescape
 from urllib.parse import unquote
 
 from . import _rust
+
+# 重型格式库(pdf/docx/md/rtf)延迟到对应解析函数内导入:纯 TXT 阅读
+# (最常见路径)不应为它们支付 import 成本(pymupdf ~130ms、docx ~40ms)。
 
 
 @lru_cache(maxsize=8192)
@@ -671,6 +670,8 @@ def _extract_content_pdf(file_path, console):
 
 
 
+    import pymupdf  # 延迟导入:仅 PDF 阅读时支付 import 成本
+
     try:
         doc = pymupdf.open(file_path)
     except Exception as e:
@@ -1035,6 +1036,8 @@ def _extract_content_docx(file_path, console):
     Extracts content from a .docx file, preserving paragraphs.
     It uses the 'python-docx' library.
     """
+    from docx import Document  # 延迟导入
+
     try:
         doc = Document(file_path)
         full_text = "\n".join([para.text for para in doc.paragraphs if para.text and not para.text.isspace()])
@@ -1054,6 +1057,8 @@ def _extract_content_rtf(file_path, console):
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             rtf_content = f.read()
             
+        from striprtf.striprtf import rtf_to_text  # 延迟导入
+
         text_content = rtf_to_text(rtf_content, errors="ignore")
         
         text_content = text_content.replace('\r\n', '\n').replace('\r', '\n')
@@ -1090,6 +1095,8 @@ def _extract_content_md(file_path, console):
     except Exception as e:
         # If raw parsing fails, try HTML conversion as fallback
         try:
+            import markdown  # 延迟导入
+
             html_content = markdown.markdown(md_content, extensions=['codehilite', 'fenced_code'])
             parser = HTMLtoLines()
             parser.feed(html_content)

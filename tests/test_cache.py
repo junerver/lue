@@ -54,23 +54,20 @@ def build_layout(chapters, width):
 
 def test_parsed_cache_roundtrip(book_path):
     chapters = cp._extract_content_txt(book_path, make_console())
-    total = 42
     stat = os.stat(book_path)
     key = cache_mod.ParsedBookCache.key_for(stat)
     c = cache_mod.ParsedBookCache(book_path, key)
-    c.store(chapters, total)
+    c.store(chapters)
     loaded = cache_mod.ParsedBookCache(book_path, key).load()
     assert loaded is not None
-    loaded_chapters, loaded_total = loaded
-    assert loaded_total == total
-    assert loaded_chapters == chapters
+    assert loaded == chapters
 
 
 def test_parsed_cache_invalidated_on_change(book_path):
     chapters = cp._extract_content_txt(book_path, make_console())
     stat = os.stat(book_path)
     key = cache_mod.ParsedBookCache.key_for(stat)
-    cache_mod.ParsedBookCache(book_path, key).store(chapters, 42)
+    cache_mod.ParsedBookCache(book_path, key).store(chapters)
     # Rewrite the file (different size) -> key changes -> cache miss.
     with open(book_path, "a", encoding="utf-8") as f:
         f.write("追加的内容让文件变长。\n")

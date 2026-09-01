@@ -82,8 +82,7 @@ class ParsedBookCache(_BaseCache):
         if not isinstance(data, dict):
             return None
         chapters = data.get("chapters")
-        total = data.get("total_sentences")
-        if not isinstance(chapters, list) or not isinstance(total, int):
+        if not isinstance(chapters, list):
             return None
         # Validate shape: list of list of str, non-empty.
         for chapter in chapters:
@@ -91,10 +90,10 @@ class ParsedBookCache(_BaseCache):
                 return None
         if not chapters:
             return None
-        return chapters, total
+        return chapters
 
-    def store(self, chapters, total_sentences) -> None:
-        self._store({"chapters": chapters, "total_sentences": total_sentences})
+    def store(self, chapters) -> None:
+        self._store({"chapters": chapters})
 
 
 class LayoutCache(_BaseCache):
@@ -136,6 +135,7 @@ class LayoutCache(_BaseCache):
             "position_to_line": position_to_line,
             "paragraph_ranges": paragraph_ranges,
             "sorted_index": sorted_index,
+            "total_sentences": data.get("total_sentences", 0) or 0,
         }
 
     def store(self, layout: dict) -> None:
@@ -146,3 +146,4 @@ class LayoutCache(_BaseCache):
             line.plain if hasattr(line, "plain") else line for line in layout["lines"]
         ]
         self._store(payload)
+

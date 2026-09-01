@@ -134,9 +134,14 @@ def preprocess_filter_args(args):
 async def main():
     # Preprocess arguments to handle filter syntax
     preprocessed_args = preprocess_filter_args(sys.argv[1:])
-    
-    tts_manager = TTSManager()
-    available_tts = tts_manager.get_available_tts_names()
+
+    # TTS 探测会 import edge_tts 等 (~200ms)。默认 -t none 下完全跳过,
+    # 仅当用户显式传了 -t(非 none)或无参数时才需要探测可用模型。
+    tts_requested = any(
+        a in ('-t', '--tts') for a in preprocessed_args
+    )
+    tts_manager = TTSManager() if tts_requested else None
+    available_tts = tts_manager.get_available_tts_names() if tts_manager else []
 
     parser = argparse.ArgumentParser(
         description="A terminal-based eBook reader with TTS",

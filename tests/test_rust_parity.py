@@ -308,6 +308,27 @@ def test_parity_clean_txt_doc_lines():
 
 
 @pytest.mark.skipif(_rust.lue_rs is None, reason="lue_rs extension not built")
+def test_parity_clean_txt_doc_lines_ellipsis_and_wide_space():
+    # Lines that trigger the non-fast-path cleaning: ellipsis collapse,
+    # full-width space normalization, markdown, unicode replacements.
+    content = (
+        "普通的一行没有特殊字符\n"
+        "这一行有省略号……还有……\n"
+        "　　这行开头是全角空格\n"
+        "**加粗**和`代码`\n"
+        "50%和3×4\n"
+        "a . . . b\n"
+        "纯文本末尾\n"
+    )
+    expected = []
+    for i, line in enumerate(content.split("\n")):
+        cleaned = cp.clean_visual_text(line.strip())
+        if cleaned:
+            expected.append((i, cleaned))
+    assert _rust.lue_rs.clean_txt_doc_lines(content) == expected
+
+
+@pytest.mark.skipif(_rust.lue_rs is None, reason="lue_rs extension not built")
 def test_parity_pick_toc_rule_and_lines():
     books = [
         build_book(chapters=10),

@@ -183,6 +183,7 @@ def update_document_layout(reader):
         reader.position_to_line = cached['position_to_line']
         reader.paragraph_line_ranges = cached['paragraph_ranges']
         reader._sorted_line_positions = cached['sorted_index']
+        reader.total_sentences = cached.get('total_sentences', 0)
     elif disk_layout is not None:
         # 与 rebuild 一致:document_lines 存普通 str,渲染时才转 Text
         reader.document_lines = disk_layout['lines']
@@ -190,86 +191,94 @@ def update_document_layout(reader):
         reader.position_to_line = disk_layout['position_to_line']
         reader.paragraph_line_ranges = disk_layout['paragraph_ranges']
         reader._sorted_line_positions = disk_layout['sorted_index']
+        reader.total_sentences = disk_layout['total_sentences']
     else:
-        # 布局重建:整章批量 wrap(一次 FFI 调用,替代逐段 dict 查找);
-        # document_lines 先存普通行文本(缓存与二分子结构都更轻),
-        # 需要渲染时才在 get_visible_content 转成 Text。
-        blank_text = Text("", style=COLORS.TEXT_NORMAL)
-        reader.document_lines = []
-        reader.line_to_position = {}
-        reader.position_to_line = {}
-        reader.paragraph_line_ranges = {}
+        # 布局重建:整书一次 Rust 调用完成 wrap + 句子切分 + 句→行映射 +
+        # 索引构建;Python 侧只做 C 级 dict(zip()) 转换。无 Rust 时回退
+        # rich 逐段 wrap 的纯 Python 路径。
+        if _rust.lue_rs is not None:
+            try:
+                (
+                    document_lines,
+                    pos_keys,
+                    pos_vals,
+                    l2p_keys,
+                    l2p_vals,
+                    range_keys,
+                    range_vals,
+                    sorted_positions,
+                    sorted_lines,
+                    total_sentences,
+                ) = _rust.lue_rs.layout_document(reader.chapters, available_width)
+                reader.document_lines = document_lines
+                reader.position_to_line = dict(zip(pos_keys, pos_vals))
+                reader.line_to_position = dict(zip(l2p_keys, l2p_vals))
+                reader.paragraph_line_ranges = dict(zip(range_keys, range_vals))
+                sorted_index = (sorted_positions, sorted_lines)
+            except _rust._PANIC_TYPES:
+                sorted_index = None
+        else:
+            sorted_index = None
 
-        wrap_paragraph = (
-            _rust.lue_rs.wrap_paragraph
-            if _rust.lue_rs is not None
-            else None
-        )
+        if sorted_index is None:
+            reader.document_lines = []
+            reader.line_to_position = {}
+            reader.position_to_line = {}
+            reader.paragraph_line_ranges = {}
+            total_sentences = 0
+            for chap_idx, chapter in enumerate(reader.chapters):
+                if chap_idx > 0:
+                    reader.document_lines.append("")
 
-        for chap_idx, chapter in enumerate(reader.chapters):
-            if chap_idx > 0:
-                reader.document_lines.append("")
-
-            for para_idx, paragraph in enumerate(chapter):
-                paragraph_start_line = len(reader.document_lines)
-
-                if wrap_paragraph is not None:
-                    try:
-                        wrapped_plains = wrap_paragraph(paragraph, available_width)
-                    except _rust._PANIC_TYPES:
-                        wrapped_plains = None
-                else:
-                    wrapped_plains = None
-                if wrapped_plains is None:
+                for para_idx, paragraph in enumerate(chapter):
+                    paragraph_start_line = len(reader.document_lines)
                     plain_text = Text(paragraph, justify="left", no_wrap=False, style=COLORS.TEXT_NORMAL)
                     wrapped_plains = [line.plain for line in plain_text.wrap(reader.console, available_width)]
+                    sentences = content_parser.split_into_sentences(paragraph)
+                    total_sentences += len(sentences)
+                    paragraph_end_line = paragraph_start_line + len(wrapped_plains) - 1
+                    reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
+                    # 双指针线性定位句首所在行(与 Rust 版语义一致)
+                    line_idx = 0
+                    line_offset = 0
+                    current_char_pos = 0
+                    for sent_idx, sentence in enumerate(sentences):
+                        sentence_start = current_char_pos
+                        while (
+                            line_idx < len(wrapped_plains)
+                            and sentence_start >= line_offset + len(wrapped_plains[line_idx])
+                        ):
+                            line_offset += len(wrapped_plains[line_idx])
+                            line_idx += 1
+                        if line_idx < len(wrapped_plains):
+                            reader.position_to_line[(chap_idx, para_idx, sent_idx)] = paragraph_start_line + line_idx
+                        current_char_pos = sentence_start + len(sentence) + 1
 
-                paragraph_end_line = paragraph_start_line + len(wrapped_plains) - 1
-                reader.paragraph_line_ranges[(chap_idx, para_idx)] = (paragraph_start_line, paragraph_end_line)
+                    for line_idx in range(len(wrapped_plains)):
+                        reader.line_to_position[paragraph_start_line + line_idx] = (chap_idx, para_idx, 0)
 
-                sentences = content_parser.split_into_sentences(paragraph)
-                # 句子起点与换行位置都单调递增,用双指针线性定位句首所在行,
-                # 避免原实现的“每句从头扫描所有行”的 O(句数×行数) 开销
-                line_idx = 0
-                line_offset = 0
-                current_char_pos = 0
-                for sent_idx, sentence in enumerate(sentences):
-                    sentence_start = current_char_pos
-                    while (
-                        line_idx < len(wrapped_plains)
-                        and sentence_start >= line_offset + len(wrapped_plains[line_idx])
-                    ):
-                        line_offset += len(wrapped_plains[line_idx])
-                        line_idx += 1
-                    if line_idx < len(wrapped_plains):
-                        reader.position_to_line[(chap_idx, para_idx, sent_idx)] = paragraph_start_line + line_idx
-                    current_char_pos = sentence_start + len(sentence) + 1
+                    reader.document_lines.extend(wrapped_plains)
 
-                for line_idx in range(len(wrapped_plains)):
-                    reader.line_to_position[paragraph_start_line + line_idx] = (chap_idx, para_idx, 0)
-
-                reader.document_lines.extend(wrapped_plains)
-
-                if para_idx < len(chapter) - 1:
-                    reader.document_lines.append("")
+                    if para_idx < len(chapter) - 1:
+                        reader.document_lines.append("")
+            # 按行排序的 (positions, lines) 平行数组(稳定排序保持插入序)
+            sorted_items = sorted(reader.position_to_line.items(), key=lambda kv: kv[1])
+            sorted_index = (
+                [pos for pos, _ in sorted_items],
+                [ln for _, ln in sorted_items],
+            )
 
         if cache is None:
             cache = reader._layout_cache = {}
-        # 按行排序的 (positions, lines) 平行数组:_get_topmost_visible_sentence
-        # 用二分替代 O(全书句子) 的 dict 扫描;稳定排序保持插入序,同一行的
-        # 多个句子位置中取插入最早的那个,与原扫描语义一致
-        sorted_items = sorted(reader.position_to_line.items(), key=lambda kv: kv[1])
-        sorted_index = (
-            [pos for pos, _ in sorted_items],
-            [ln for _, ln in sorted_items],
-        )
         reader._sorted_line_positions = sorted_index
+        reader.total_sentences = total_sentences
         cache[available_width] = {
             'lines': reader.document_lines,
             'line_to_position': reader.line_to_position,
             'position_to_line': reader.position_to_line,
             'paragraph_ranges': reader.paragraph_line_ranges,
             'sorted_index': sorted_index,
+            'total_sentences': total_sentences,
         }
         # 持久化布局缓存(后台线程写盘,不阻塞渲染也不依赖事件循环
         # 状态;asyncio.get_event_loop 在无事件循环的同步加载期会抛错)

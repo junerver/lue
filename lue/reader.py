@@ -112,16 +112,16 @@ class Lue:
         if not quiet:
             self.console.print(f"[bold cyan]Loading document: {self.book_title}...[/bold cyan]")
 
-        # 磁盘缓存:同一文件(mtime+size 不变)跳过解析与句子统计。
-        # 命中后仍需重建布局(按宽度),但那由 update_document_layout
-        # 的布局缓存覆盖;缓存损坏/不匹配一律回退完整解析。
+        # 磁盘缓存:同一文件(mtime+size 不变)跳过整书解析。
+        # total_sentences 不再独立统计(布局重建时顺手累加);缓存损坏/
+        # 不匹配一律回退完整解析。
         cache_hit = False
         try:
             stat = os.stat(self.file_path)
             self._parsed_cache = cache.ParsedBookCache(self.file_path, cache.ParsedBookCache.key_for(stat))
             loaded = self._parsed_cache.load()
             if loaded is not None:
-                self.chapters, self.total_sentences = loaded
+                self.chapters = loaded
                 cache_hit = True
         except Exception:
             loaded = None
@@ -135,21 +135,20 @@ class Lue:
                 self.console.print("This might happen with image-based PDFs or unsupported formats.")
                 sys.exit(1)
 
-            all_paragraphs = [p for chapter in self.chapters for p in chapter]
-            total = None
-            if _rust.lue_rs is not None:
-                try:
-                    total = sum(len(s) for s in _rust.lue_rs.split_sentences_batch(all_paragraphs))
-                except _rust._PANIC_TYPES:
-                    total = None
-            if total is None:
-                total = sum(
-                    len(content_parser.split_into_sentences(paragraph))
-                    for paragraph in all_paragraphs
-                )
-            self.total_sentences = total
+            # 解析缓存写盘放后台线程:冷开不等它,避免 pickle 整书阻塞首帧
             try:
-                self._parsed_cache.store(self.chapters, self.total_sentences)
+                import threading
+
+                parsed_cache = self._parsed_cache
+                chapters = self.chapters
+
+                def _persist_parsed():
+                    try:
+                        parsed_cache.store(chapters)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_persist_parsed, daemon=True).start()
             except Exception:
                 pass
 

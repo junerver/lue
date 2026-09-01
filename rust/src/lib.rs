@@ -302,15 +302,56 @@ fn clean_visual_text(text: &str) -> String {
     clean_visual_text_impl(text)
 }
 
+/// Fast-path precheck: if a line contains no character that any cleaning
+/// rule can change, `clean_visual_text(line) == line` for an already-trimmed
+/// line. Verified against the real 11MB book: 92% of lines take this path
+/// and zero lines are misclassified (see benchmarks/clean_precheck_probe.py).
+fn clean_precheck_safe(text: &str) -> bool {
+    let mut prev_ws = false;
+    for c in text.chars() {
+        if matches!(
+            c,
+            '!' | '#' | '%' | '*' | '+' | ',' | '-' | '.' | '/' | ':' | ';' | '='
+                | '?' | '[' | '\\' | ']' | '^' | '_' | '`' | '{' | '|' | '}' | '~'
+                | '×' | '÷' | '±' | '≤' | '≥' | '≠' | '≈' | '∞' | '°' | '™' | '®'
+                | '©' | '§' | '’' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+                | '\u{00ad}' | '\u{2026}'
+        ) {
+            return false;
+        }
+        if c.is_whitespace() {
+            // any non-ASCII-space whitespace (e.g. U+3000) is normalized by
+            // \s+ -> ' '; consecutive ASCII spaces also collapse.
+            if c != ' ' || prev_ws {
+                return false;
+            }
+            prev_ws = true;
+        } else {
+            prev_ws = false;
+        }
+    }
+    true
+}
+
 /// Batch form of the per-line cleaning loop in `_extract_content_txt`:
 /// `(line_no, clean_visual_text(line.strip()))` for every non-empty result.
 pub fn clean_txt_doc_lines_impl(content: &str) -> Vec<(usize, String)> {
-    content
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| (i, clean_visual_text_impl(py_trim(line))))
-        .filter(|(_, text)| !text.is_empty())
-        .collect()
+    let mut out = Vec::new();
+    for (i, line) in content.split('\n').enumerate() {
+        let trimmed = py_trim(line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let text = if clean_precheck_safe(trimmed) {
+            trimmed.to_string()
+        } else {
+            clean_visual_text_impl(trimmed)
+        };
+        if !text.is_empty() {
+            out.push((i, text));
+        }
+    }
+    out
 }
 
 #[pyfunction]
@@ -840,9 +881,43 @@ pub fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Wrap a paragraph and compute the sentence->line mapping in one pass,
+/// mirroring the two-pointer scan in ui.update_document_layout. Sentences
+/// are split internally (no FFI round-trip of the sentence list). Returns
+/// (wrapped_lines, sentence_line_indices, sentence_count) where
+/// sentence_line_indices[i] is the wrapped-line index of sentence i (-1 if
+/// it falls past the last line).
+#[pyfunction]
+fn layout_paragraph(text: &str, width: usize) -> (Vec<String>, Vec<i64>, usize) {
+    let sentences = split_sentences_impl(text);
+    let sentence_count = sentences.len();
+    let wrapped = wrap_plain(text, width);
+    let mut line_idx = 0usize;
+    let mut line_offset = 0usize;
+    let mut current_char_pos = 0usize;
+    let mut out = Vec::with_capacity(sentence_count);
+    let plain_lens: Vec<usize> = wrapped.iter().map(|l| l.chars().count()).collect();
+    for sentence in &sentences {
+        let sentence_start = current_char_pos;
+        while line_idx < plain_lens.len()
+            && sentence_start >= line_offset + plain_lens[line_idx]
+        {
+            line_offset += plain_lens[line_idx];
+            line_idx += 1;
+        }
+        if line_idx < plain_lens.len() {
+            out.push(line_idx as i64);
+        } else {
+            out.push(-1);
+        }
+        current_char_pos = sentence_start + sentence.chars().count() + 1;
+    }
+    (wrapped, out, sentence_count)
+}
+
+/// Diagnostic: char cell width, same as rich.cells.get_character_cell_size.
 #[pyfunction]
 fn char_cell_width_py(c: String) -> usize {
-    // rich.cells.get_character_cell_size takes a single char
     match c.chars().next() {
         Some(ch) => char_cell_width(ch),
         None => 0,
@@ -872,6 +947,98 @@ fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
     wrap_plain(text, width)
 }
 
+/// Whole-document layout in one Rust call: wraps every paragraph, builds
+/// the sentence->line index, line->paragraph index, paragraph ranges and
+/// the line-sorted position index. Returns flat parallel vectors that
+/// Python turns into dicts with C-speed dict(zip(...)).
+///
+/// Mirrors ui.update_document_layout's rebuild exactly: a blank separator
+/// line between chapters and between paragraphs of the same chapter;
+/// positions whose sentence start falls past the last wrapped line are
+/// omitted; line_to_position maps every line to (chapter, para, 0).
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+fn layout_document(
+    chapters: Vec<Vec<String>>,
+    width: usize,
+) -> (
+    Vec<String>,                  // document_lines
+    Vec<(i64, i64, i64)>,         // position_to_line keys
+    Vec<i64>,                     // position_to_line values
+    Vec<i64>,                     // line_to_position keys
+    Vec<(i64, i64, i64)>,         // line_to_position values
+    Vec<(i64, i64)>,              // paragraph_line_ranges keys
+    Vec<(i64, i64)>,              // paragraph_line_ranges values
+    Vec<(i64, i64, i64)>,         // sorted index positions
+    Vec<i64>,                     // sorted index lines
+    usize,                        // total_sentences
+) {
+    let mut document_lines: Vec<String> = Vec::new();
+    let mut pos_keys: Vec<(i64, i64, i64)> = Vec::new();
+    let mut pos_vals: Vec<i64> = Vec::new();
+    let mut l2p_keys: Vec<i64> = Vec::new();
+    let mut l2p_vals: Vec<(i64, i64, i64)> = Vec::new();
+    let mut range_keys: Vec<(i64, i64)> = Vec::new();
+    let mut range_vals: Vec<(i64, i64)> = Vec::new();
+    let mut total_sentences = 0usize;
+
+    for (chap_idx, chapter) in chapters.iter().enumerate() {
+        if chap_idx > 0 {
+            document_lines.push(String::new());
+        }
+        let chap = chap_idx as i64;
+        for (para_idx, paragraph) in chapter.iter().enumerate() {
+            let paragraph_start_line = document_lines.len();
+            let (wrapped, sentence_lines, sentence_count) =
+                layout_paragraph(paragraph, width);
+            total_sentences += sentence_count;
+            let para = para_idx as i64;
+            range_keys.push((chap, para));
+            range_vals.push((
+                paragraph_start_line as i64,
+                (paragraph_start_line + wrapped.len() - 1) as i64,
+            ));
+            for (sent_idx, line_in_para) in sentence_lines.iter().enumerate() {
+                if *line_in_para >= 0 {
+                    pos_keys.push((chap, para, sent_idx as i64));
+                    pos_vals.push((paragraph_start_line + *line_in_para as usize) as i64);
+                }
+            }
+            for k in 0..wrapped.len() {
+                l2p_keys.push((paragraph_start_line + k) as i64);
+                l2p_vals.push((chap, para, 0));
+            }
+            document_lines.extend(wrapped);
+            if para_idx < chapter.len() - 1 {
+                document_lines.push(String::new());
+            }
+        }
+    }
+
+    // line-sorted position index: sort (line, insertion_order) pairs. The
+    // insertion order of pos_keys is (chapter, para, sentence) ascending and
+    // lines are non-decreasing along it, so a stable sort by line preserves
+    // the first-inserted-per-line semantics of the original scan.
+    let mut pairs: Vec<((i64, i64, i64), i64)> =
+        pos_keys.iter().cloned().zip(pos_vals.iter().cloned()).collect();
+    pairs.sort_by_key(|&(_, line)| line);
+    let sorted_positions: Vec<(i64, i64, i64)> = pairs.iter().map(|&(p, _)| p).collect();
+    let sorted_lines: Vec<i64> = pairs.iter().map(|&(_, l)| l).collect();
+
+    (
+        document_lines,
+        pos_keys,
+        pos_vals,
+        l2p_keys,
+        l2p_vals,
+        range_keys,
+        range_vals,
+        sorted_positions,
+        sorted_lines,
+        total_sentences,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Python module
 // ---------------------------------------------------------------------------
@@ -887,6 +1054,8 @@ fn lue_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(collect_title_lines, m)?)?;
     m.add_function(wrap_pyfunction!(split_long_text_paragraphs, m)?)?;
     m.add_function(wrap_pyfunction!(wrap_paragraph, m)?)?;
+    m.add_function(wrap_pyfunction!(layout_paragraph, m)?)?;
+    m.add_function(wrap_pyfunction!(layout_document, m)?)?;
     m.add_function(wrap_pyfunction!(char_cell_width_py, m)?)?;
     m.add_function(wrap_pyfunction!(cell_len_py, m)?)?;
     m.add_function(wrap_pyfunction!(expand_tabs_py, m)?)?;
