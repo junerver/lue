@@ -38,7 +38,7 @@ jobs:
             artifact: lue-linux-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: lue-windows-x86_64
+            artifact: lue-windows-x86_64.exe
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: lue-macos-x86_64
