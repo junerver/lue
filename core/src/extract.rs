@@ -686,8 +686,38 @@ fn rtf_to_text(rtf: &str) -> String {
 /// cleaned lines. PyMuPDF's positional footnote/header filtering has no
 /// equivalent in a plain text flow, so noisy-margin PDFs read noisier here.
 pub fn extract_pdf_docs(path: &Path) -> Result<Vec<String>, LueError> {
-    let text = pdf_extract::extract_text(path)
-        .map_err(|e| LueError::Invalid(format!("PDF extraction failed: {e}")))?;
+    // pdf-extract is written around `Identity-H`/`Identity-V` CID fonts and
+    // `assert!`s (or panics) on anything else — e.g. Chinese PDFs that set
+    // /Encoding to /GBK2K-H. That abort would kill the whole reader, so catch
+    // the unwind here and surface a readable error instead. The book is
+    // usually a scanned or CJK document whose text layer we cannot decode;
+    // the caller shows "no readable content" and the user gets a clean exit
+    // rather than a crash. The panic hook is silenced for the duration so the
+    // expected condition does not spew a stack trace over a UI the user is
+    // trying to read.
+    let result = {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text(path)
+        }));
+        std::panic::set_hook(hook);
+        result
+    };
+    let text = match result {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            return Err(LueError::Invalid(format!("PDF extraction failed: {e}")));
+        }
+        Err(_) => {
+            return Err(LueError::Invalid(
+                "PDF text extraction aborted: unsupported font encoding \
+                 (e.g. a Chinese /GBK2K-H CID font). The document may be a \
+                 scan whose text layer cannot be decoded."
+                    .into(),
+            ));
+        }
+    };
     Ok(pdf_text_to_docs(&text))
 }
 
@@ -913,6 +943,76 @@ mod tests {
         let joined = docs.join("\n");
         assert!(joined.contains("Beginning"), "got: {joined:?}");
         assert!(joined.contains("chapter two body"), "got: {joined:?}");
+    }
+
+    /// A Chinese PDF that sets /Encoding /GBK2K-H on a Type0 font used to
+    /// crash pdf-extract's `assert!(name == "Identity-H")` and abort the
+    /// whole reader. It must now surface as a readable error, not a panic.
+    #[test]
+    fn pdf_gbk_encoded_cid_font_returns_error_instead_of_panicking() {
+        let dir = std::env::temp_dir().join("lue_pdf_gbk_extract");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gbk.pdf");
+        std::fs::write(&path, build_gbk_cid_fixture_pdf()).unwrap();
+        let err = extract_pdf_docs(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("PDF") || msg.contains("encoding") || msg.contains("scan"),
+            "expected a readable PDF error, got: {msg}"
+        );
+    }
+
+    /// One-page PDF whose single Type0 font carries /Encoding /GBK2K-H —
+    /// exactly what trips pdf-extract's Identity-H assertion.
+    fn build_gbk_cid_fixture_pdf() -> Vec<u8> {
+        let content = "BT /F1 16 Tf 72 720 Td <D6D0> Tj ET";
+        let plain: [(usize, &str); 5] = [
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+                 /Resources << /Font << /F1 5 0 R >> >> >>",
+            ),
+            (
+                5,
+                "<< /Type /Font /Subtype /Type0 /BaseFont /SimHei \
+                 /Encoding /GBK2K-H /DescendantFonts [6 0 R] >>",
+            ),
+            (
+                6,
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /SimHei \
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> >>",
+            ),
+        ];
+        let streams: [(usize, &str); 1] = [(4, content)];
+
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = [0usize; 7];
+        for (num, body) in &plain {
+            offsets[*num] = out.len();
+            out.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        for (num, stream) in &streams {
+            offsets[*num] = out.len();
+            out.extend_from_slice(
+                format!(
+                    "{num} 0 obj\n<< /Length {} >>\nstream\n{stream}\nendstream\nendobj\n",
+                    stream.len()
+                )
+                .as_bytes(),
+            );
+        }
+        let xref = out.len();
+        out.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+        for off in &offsets[1..] {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        out
     }
 
     fn build_fixture_pdf() -> Vec<u8> {
