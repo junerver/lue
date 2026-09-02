@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "lue"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "lue_core"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "encoding_rs",
  "fancy-regex",

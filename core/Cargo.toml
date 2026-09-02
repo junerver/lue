@@ -1,6 +1,6 @@
 [package]
 name = "lue_core"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2021"
 description = "Pure-Rust document core for the lue reader: text pipeline, TXT indexing and layout engine"
 

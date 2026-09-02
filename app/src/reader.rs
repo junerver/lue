@@ -268,9 +268,35 @@ impl ReaderState {
     }
 
     pub fn page_down(&mut self) -> Result<()> {
-        // One screenful; when the tail of the window is near, the next
-        // page continues at the next chapter head instead of running off.
-        self.scroll_down((self.body_height as usize).saturating_sub(1))
+        // One screenful. When the tail of the window is near, keep advancing
+        // by sliding the window and continuing from the content just below
+        // the old viewport bottom, instead of clamping to whatever few lines
+        // remain (which made M only creep a couple of rows at a chapter end).
+        let height = (self.body_height as usize).saturating_sub(1).max(1);
+        let max = self.max_scroll();
+        if self.scroll < max && self.scroll + height <= max {
+            self.scroll += height;
+            return Ok(());
+        }
+        if self.center + 1 < self.total_chapters {
+            // Content under the old viewport bottom (inside the viewport or
+            // one line beyond it), then continue at the next paragraph.
+            let bottom = (self.scroll + height).min(self.layout.lines.len().saturating_sub(1));
+            let anchor = self.anchor_at(bottom).1;
+            let next = self.center + 1;
+            self.reload_window(next)?;
+            self.scroll = self
+                .layout
+                .line_of(anchor)
+                .map(|line| self.next_paragraph_start(line))
+                .unwrap_or(self.first_line_of(next))
+                .min(self.max_scroll());
+            self.clamp_scroll();
+        } else if self.scroll < max {
+            // Last chapter: scroll to the window bottom, no more content.
+            self.scroll = max;
+        }
+        Ok(())
     }
 
     pub fn page_up(&mut self) -> Result<()> {
@@ -436,21 +462,31 @@ mod slide_anchor_tests {
     }
 
     #[test]
-    fn page_down_at_blank_top_keeps_reading_position() {
+    fn page_down_at_window_tail_advances_off_blank_top() {
         let dir = std::env::temp_dir().join("lue_slide_anchor");
         fs::create_dir_all(&dir).unwrap();
-        let path = make_book(&dir, "slide-anchor.txt", 14, 40);
+        // 30 chapters: the walk below must land on a mid-book window tail,
+        // never slide all the way to the last chapter (where paging has no
+        // content to advance into).
+        let path = make_book(&dir, "slide-anchor.txt", 30, 40);
         let mut hit_blank_top = false;
         for body_height in 4..=34u16 {
             let mut state = ReaderState::open(&path, 100, body_height).unwrap();
-            // walk to the first window tail that still has a next chapter
+            // walk to a window tail whose top line is a blank separator and
+            // whose window still has chapter content after it
             for _ in 0..300 {
-                if state.scroll == state.max_scroll() && state.center + 1 < state.total_chapters {
+                if state.scroll == state.max_scroll()
+                    && state.center + 1 < state.total_chapters
+                    && state.center + 2 + 1 < state.total_chapters
+                {
                     break;
                 }
                 state.page_down().unwrap();
             }
-            if state.scroll != state.max_scroll() || state.center + 1 >= state.total_chapters {
+            if state.scroll != state.max_scroll()
+                || state.center + 1 >= state.total_chapters
+                || state.center + 3 >= state.total_chapters
+            {
                 continue;
             }
             let top = state.scroll.min(state.layout.lines.len().saturating_sub(1));
@@ -458,13 +494,36 @@ mod slide_anchor_tests {
                 continue;
             }
             hit_blank_top = true;
-            let before = state.layout.line_position(top);
+            // Content under the old top (chapter, paragraph). Blank top lines
+            // own no paragraph, so resolve to the content above.
+            let Some((before_c, before_p)) = state
+                .layout
+                .line_position(top)
+                .map(|(c, p, _)| (c, p))
+            else {
+                continue;
+            };
             state.page_down().unwrap();
-            let after = state.layout.line_position(state.scroll);
-            assert_eq!(
-                after, before,
-                "body_height {body_height}: paging past the window tail must anchor to the \
-                 content under the old top line, not jump to the window centre chapter"
+            // M at the window tail must *advance* in content (a later chapter
+            // or a later paragraph), and the new top line must be content,
+            // not the blank separator the old anchor used to land on.
+            let after_top = state.scroll.min(state.layout.lines.len().saturating_sub(1));
+            let Some((after_c, after_p)) = state
+                .layout
+                .line_position(after_top)
+                .map(|(c, p, _)| (c, p))
+            else {
+                continue;
+            };
+            assert!(
+                after_c > before_c || (after_c == before_c && after_p > before_p),
+                "body_height {body_height}: paging past the window tail must advance \
+                 in content (was ({before_c},{before_p}), now ({after_c},{after_p}))"
+            );
+            assert!(
+                !state.layout.lines[after_top].trim().is_empty(),
+                "body_height {body_height}: the page after the window tail must open on \
+                 content, not on a blank separator line"
             );
         }
         assert!(hit_blank_top, "no blank-top tail scenario exercised");
